@@ -1,0 +1,7 @@
+{
+  "name": "pyodide-mcp-runtime",
+  "private": true,
+  "dependencies": {
+    "pyodide": "314.0.2"
+  }
+}
