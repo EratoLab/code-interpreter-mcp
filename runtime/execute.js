@@ -40,6 +40,28 @@ function encodeBase64(bytes) {
   return btoa(binary);
 }
 
+function mimeTypeForPath(path) {
+  const extension = path.includes(".") ? path.split(".").at(-1).toLowerCase() : "";
+  return {
+    avif: "image/avif",
+    bmp: "image/bmp",
+    csv: "text/csv",
+    gif: "image/gif",
+    htm: "text/html",
+    html: "text/html",
+    jpeg: "image/jpeg",
+    jpg: "image/jpeg",
+    json: "application/json",
+    pdf: "application/pdf",
+    png: "image/png",
+    svg: "image/svg+xml",
+    tif: "image/tiff",
+    tiff: "image/tiff",
+    txt: "text/plain",
+    webp: "image/webp",
+  }[extension] ?? "application/octet-stream";
+}
+
 function collectCreatedFiles(FS, initialFiles) {
   const files = [];
   let totalBytes = 0;
@@ -61,6 +83,7 @@ function collectCreatedFiles(FS, initialFiles) {
     files.push({
       path: file.path,
       content_base64: encodeBase64(bytes),
+      mime_type: mimeTypeForPath(file.path),
     });
     totalBytes += bytes.byteLength;
   }

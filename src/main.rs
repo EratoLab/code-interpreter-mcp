@@ -49,6 +49,10 @@ struct InputFile {
     path: String,
 
     /// File contents encoded as canonical RFC 4648 Base64.
+    #[schemars(extend(
+        "contentEncoding" = "base64",
+        "chat.erato/file_content_field" = true
+    ))]
     content_base64: String,
 }
 
@@ -108,10 +112,18 @@ impl RunPythonCodeOutput {
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct OutputFile {
     /// Path relative to /workspace.
+    #[schemars(extend("chat.erato/file_name_field" = true))]
     path: String,
 
     /// File contents encoded as canonical RFC 4648 Base64.
+    #[schemars(extend(
+        "contentEncoding" = "base64",
+        "chat.erato/file_content_field" = true
+    ))]
     content_base64: String,
+
+    /// MIME type inferred from the file extension.
+    mime_type: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -285,6 +297,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn request(path: &str, data: &[u8]) -> RunPythonCodeRequest {
         RunPythonCodeRequest {
@@ -316,5 +329,70 @@ mod tests {
         let mut input = request("input.bin", b"");
         input.files[0].content_base64 = "not base64".to_owned();
         assert!(validate_request(input).is_err());
+    }
+
+    #[test]
+    fn advertises_erato_file_metadata() {
+        let tool = PyodideMcpServer::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "run_python_code")
+            .unwrap();
+        let input_schema = Value::Object(tool.input_schema.as_ref().clone());
+        let output_schema = Value::Object(tool.output_schema.unwrap().as_ref().clone());
+
+        let input_content = find_property_schema(&input_schema, "content_base64").unwrap();
+        assert_eq!(input_content["contentEncoding"], "base64");
+        assert_eq!(input_content["chat.erato/file_content_field"], true);
+
+        let output_file =
+            find_object_schema_with_property(&output_schema, "content_base64").unwrap();
+        let output_properties = output_file["properties"].as_object().unwrap();
+        assert_eq!(
+            output_properties["content_base64"]["contentEncoding"],
+            "base64"
+        );
+        assert_eq!(
+            output_properties["content_base64"]["chat.erato/file_content_field"],
+            true
+        );
+        assert_eq!(
+            output_properties["path"]["chat.erato/file_name_field"],
+            true
+        );
+        assert!(
+            output_file["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("mime_type".to_owned()))
+        );
+    }
+
+    fn find_property_schema<'a>(schema: &'a Value, property: &str) -> Option<&'a Value> {
+        find_object_schema_with_property(schema, property)?["properties"].get(property)
+    }
+
+    fn find_object_schema_with_property<'a>(
+        schema: &'a Value,
+        property: &str,
+    ) -> Option<&'a Value> {
+        match schema {
+            Value::Object(object) => {
+                if object
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|properties| properties.contains_key(property))
+                {
+                    return Some(schema);
+                }
+                object
+                    .values()
+                    .find_map(|value| find_object_schema_with_property(value, property))
+            }
+            Value::Array(array) => array
+                .iter()
+                .find_map(|value| find_object_schema_with_property(value, property)),
+            _ => None,
+        }
     }
 }

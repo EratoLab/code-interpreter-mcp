@@ -91,8 +91,9 @@ The result contains `success`, captured `stdout` and `stderr`, the string form
 of the final Python expression, `files`, a structured error/traceback,
 `timed_out`, and `output_truncated`. `files` contains regular files that are
 present below `/workspace` at the end of execution but were not present when
-the script started. Each entry has `path` and `content_base64`. Input files and
-temporary files deleted before execution ends are not returned.
+the script started. Each entry has `path`, `content_base64`, and a `mime_type`
+inferred from the path. Input files and temporary files deleted before
+execution ends are not returned.
 
 For example, this creates `files` containing a Base64-encoded `results.csv`:
 
