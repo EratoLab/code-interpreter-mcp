@@ -147,12 +147,12 @@ pub(crate) struct ValidatedFile {
 }
 
 #[derive(Clone)]
-struct PyodideMcpServer {
+struct CodeInterpreterMcpServer {
     runtime: PyodideRuntime,
 }
 
 #[tool_router]
-impl PyodideMcpServer {
+impl CodeInterpreterMcpServer {
     fn new() -> Self {
         Self {
             runtime: PyodideRuntime::new(),
@@ -178,11 +178,11 @@ impl PyodideMcpServer {
 }
 
 #[tool_handler(
-    name = "pyodide-mcp",
+    name = "code-interpreter-mcp",
     version = "0.1.0",
     instructions = "Use run_python_code to execute Python in a fresh Pyodide WebAssembly sandbox."
 )]
-impl ServerHandler for PyodideMcpServer {}
+impl ServerHandler for CodeInterpreterMcpServer {}
 
 fn validate_request(request: RunPythonCodeRequest) -> Result<RuntimeRequest> {
     if request.code.len() > MAX_CODE_BYTES {
@@ -261,13 +261,13 @@ fn validate_relative_path(value: &str) -> Result<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let configured_address =
-        env::var("PYODIDE_MCP_BIND_ADDR").unwrap_or_else(|_| DEFAULT_BIND_ADDRESS.to_owned());
+    let configured_address = env::var("CODE_INTERPRETER_MCP_BIND_ADDR")
+        .unwrap_or_else(|_| DEFAULT_BIND_ADDRESS.to_owned());
     let bind_address: SocketAddr = configured_address
         .parse()
-        .with_context(|| format!("invalid PYODIDE_MCP_BIND_ADDR: {configured_address}"))?;
+        .with_context(|| format!("invalid CODE_INTERPRETER_MCP_BIND_ADDR: {configured_address}"))?;
 
-    let server = PyodideMcpServer::new();
+    let server = CodeInterpreterMcpServer::new();
     let http_service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
@@ -282,7 +282,7 @@ async fn main() -> Result<()> {
         .context("failed to read MCP HTTP listening address")?;
 
     println!(
-        "pyodide-mcp listening on port {} at http://{listening_address}/mcp",
+        "code-interpreter-mcp listening on port {} at http://{listening_address}/mcp",
         listening_address.port()
     );
     io::stdout()
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn advertises_erato_file_metadata() {
-        let tool = PyodideMcpServer::tool_router()
+        let tool = CodeInterpreterMcpServer::tool_router()
             .list_all()
             .into_iter()
             .find(|tool| tool.name == "run_python_code")

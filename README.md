@@ -1,4 +1,4 @@
-# pyodide-mcp
+# code-interpreter-mcp
 
 An MCP Streamable HTTP server exposing one tool, `run_python_code`. Python runs
 in a fresh [Pyodide](https://pyodide.org/) WebAssembly instance embedded
@@ -40,19 +40,19 @@ cargo build --release
 ```
 
 `npm install` obtains the pinned Pyodide distribution assets. The runtime
-binary is `target/release/pyodide-mcp`.
+binary is `target/release/code-interpreter-mcp`.
 
 Start the server:
 
 ```bash
-./target/release/pyodide-mcp
+./target/release/code-interpreter-mcp
 ```
 
 It listens on `127.0.0.1:8000` by default and announces the effective port and
 endpoint after binding:
 
 ```text
-pyodide-mcp listening on port 8000 at http://127.0.0.1:8000/mcp
+code-interpreter-mcp listening on port 8000 at http://127.0.0.1:8000/mcp
 ```
 
 Example MCP client configuration:
@@ -60,7 +60,7 @@ Example MCP client configuration:
 ```json
 {
   "mcpServers": {
-    "pyodide": {
+    "code-interpreter-mcp": {
       "url": "http://127.0.0.1:8000/mcp"
     }
   }
@@ -136,12 +136,12 @@ repository.
 
 Environment variables:
 
-- `PYODIDE_MCP_BIND_ADDR`: HTTP socket address. Defaults to `127.0.0.1:8000`.
+- `CODE_INTERPRETER_MCP_BIND_ADDR`: HTTP socket address. Defaults to `127.0.0.1:8000`.
   Use `127.0.0.1:0` to let the operating system select a free port; the
   selected port is included in the startup announcement.
-- `PYODIDE_MCP_ALLOWED_HOSTS`: comma-separated HTTPS package hosts. Defaults to
+- `CODE_INTERPRETER_MCP_ALLOWED_HOSTS`: comma-separated HTTPS package hosts. Defaults to
   `cdn.jsdelivr.net,pypi.org,files.pythonhosted.org`. Subdomains are accepted.
-- `PYODIDE_MCP_ASSET_DIR`: overrides the local Pyodide asset directory. It must
+- `CODE_INTERPRETER_MCP_ASSET_DIR`: overrides the local Pyodide asset directory. It must
   contain the files installed by the pinned `pyodide` npm package.
 
 Per request limits:

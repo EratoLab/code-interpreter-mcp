@@ -1566,7 +1566,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pyodide-mcp"
+name = "code-interpreter-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",

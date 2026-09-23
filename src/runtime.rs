@@ -76,7 +76,7 @@ pub(crate) struct PyodideRuntime {
 
 impl PyodideRuntime {
     pub(crate) fn new() -> Self {
-        let mut allowed_hosts = env::var("PYODIDE_MCP_ALLOWED_HOSTS")
+        let mut allowed_hosts = env::var("CODE_INTERPRETER_MCP_ALLOWED_HOSTS")
             .unwrap_or_default()
             .split(',')
             .map(|host| host.trim().to_ascii_lowercase())
@@ -90,14 +90,14 @@ impl PyodideRuntime {
             ]);
         }
 
-        let asset_dir = env::var_os("PYODIDE_MCP_ASSET_DIR")
+        let asset_dir = env::var_os("CODE_INTERPRETER_MCP_ASSET_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("node_modules/pyodide")
             });
 
         let client = reqwest::Client::builder()
-            .user_agent(concat!("pyodide-mcp/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("code-interpreter-mcp/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(45))
             .build()
             .expect("the static HTTP client configuration is valid");
@@ -280,7 +280,7 @@ fn ensure_assets(asset_dir: &Path) -> Result<()> {
         let path = asset_dir.join(asset);
         if !path.is_file() {
             bail!(
-                "Pyodide asset {} is missing; run `npm install` or set PYODIDE_MCP_ASSET_DIR",
+                "Pyodide asset {} is missing; run `npm install` or set CODE_INTERPRETER_MCP_ASSET_DIR",
                 path.display()
             );
         }

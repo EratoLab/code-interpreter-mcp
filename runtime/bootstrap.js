@@ -219,7 +219,7 @@
   globalThis.navigator = Object.freeze({
     maxTouchPoints: 0,
     platform: "deno_core",
-    userAgent: "pyodide-mcp-deno-core",
+    userAgent: "code-interpreter-mcp-deno-core",
   });
   globalThis.window = globalThis;
   globalThis.self = globalThis;
