@@ -1,0 +1,302 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [ '**' ]
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+*'
+    paths:
+      - '.github/workflows/docker-build.yml'
+      - 'src/**'
+      - 'runtime/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'package.json'
+      - 'package-lock.json'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/docker-build.yml'
+      - 'src/**'
+      - 'runtime/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'package.json'
+      - 'package-lock.json'
+
+env:
+  REGISTRY: registry.eratolabs.com
+  IMAGE_NAME: erato/code-interpreter-mcp
+  SHA_TAG: ${{ github.sha }}
+  RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+  PUBLISH_LATEST: ${{ github.ref_name == 'main' || github.ref_type == 'tag' }}
+
+jobs:
+  resolve-registry-cache-refs:
+    name: Resolve registry build-cache refs
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      target: ${{ steps.cache-refs.outputs.target }}
+      source: ${{ steps.cache-refs.outputs.source }}
+      destination: ${{ steps.cache-refs.outputs.destination }}
+      branch_tag: ${{ steps.cache-refs.outputs.branch_tag }}
+    steps:
+      - name: Resolve branch-aware cache scopes
+        id: cache-refs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+
+          cache_scope() {
+            local repository="$1"
+            local branch="$2"
+
+            if [[ "$repository" == "$REPOSITORY" && "$branch" == "main" ]]; then
+              printf 'main'
+            else
+              printf 'branch-%s' "$(printf '%s' "${repository}:${branch}" | sha256sum | cut -c1-32)"
+            fi
+          }
+
+          target_scope="main"
+          source_scope=""
+          destination_scope="main"
+          branch_tag=""
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            target_scope="$(cache_scope "$BASE_REPOSITORY" "$BASE_BRANCH")"
+            source_scope="$(cache_scope "$HEAD_REPOSITORY" "$HEAD_BRANCH")"
+            destination_scope="$source_scope"
+          elif [[ "$REF_TYPE" == "branch" ]]; then
+            destination_scope="$(cache_scope "$REPOSITORY" "$REF_NAME")"
+            if [[ "$REF_NAME" != "main" ]]; then
+              source_scope="$destination_scope"
+              branch_tag="$destination_scope"
+            fi
+          fi
+
+          {
+            echo "target=$target_scope"
+            echo "source=$source_scope"
+            echo "destination=$destination_scope"
+            echo "branch_tag=$branch_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  lint-dockerfile:
+    timeout-minutes: 10
+    name: "lint dockerfile"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Lint Dockerfile"
+        uses: jbergstroem/hadolint-gh-action@v1.12.2
+        with:
+          dockerfile: Dockerfile
+
+  test:
+    runs-on: ubuntu-24.04
+    name: "test"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Install Rust toolchain"
+        run: cargo --help
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: "true"
+
+      - name: "Run tests"
+        run: cargo test --all-features --locked
+
+  build-and-push-amd64:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    needs: [resolve-registry-cache-refs, lint-dockerfile, test]
+    env:
+      CACHE_TARGET: ${{ needs.resolve-registry-cache-refs.outputs.target }}
+      CACHE_SOURCE: ${{ needs.resolve-registry-cache-refs.outputs.source }}
+      CACHE_DESTINATION: ${{ needs.resolve-registry-cache-refs.outputs.destination }}
+      BRANCH_IMAGE_TAG: ${{ needs.resolve-registry-cache-refs.outputs.branch_tag }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Erato Labs registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ERATOLABS_REGISTRY_USERNAME }}
+          password: ${{ secrets.ERATOLABS_REGISTRY_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6.15.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.PUBLISH_LATEST == 'true' && format('{0}/{1}:latest-amd64', env.REGISTRY, env.IMAGE_NAME) || '' }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.SHA_TAG }}-amd64
+            ${{ env.BRANCH_IMAGE_TAG != '' && format('{0}/{1}:{2}-amd64', env.REGISTRY, env.IMAGE_NAME, env.BRANCH_IMAGE_TAG) || '' }}
+            ${{ env.RELEASE_VERSION != '' && format('{0}/{1}:{2}-amd64', env.REGISTRY, env.IMAGE_NAME, env.RELEASE_VERSION) || '' }}
+          cache-from: |
+            type=registry,image-manifest=true,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.CACHE_TARGET }}-amd64-buildcache
+            ${{ env.CACHE_SOURCE != '' && format('type=registry,image-manifest=true,ref={0}/{1}:{2}-amd64-buildcache', env.REGISTRY, env.IMAGE_NAME, env.CACHE_SOURCE) || '' }}
+            ${{ env.CACHE_TARGET != 'main' && format('type=registry,image-manifest=true,ref={0}/{1}:main-amd64-buildcache', env.REGISTRY, env.IMAGE_NAME) || '' }}
+          cache-to: type=registry,image-manifest=true,mode=max,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.CACHE_DESTINATION }}-amd64-buildcache
+
+  build-and-push-arm64:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04-arm64-custom-large
+    needs: [resolve-registry-cache-refs, lint-dockerfile, test]
+    env:
+      CACHE_TARGET: ${{ needs.resolve-registry-cache-refs.outputs.target }}
+      CACHE_SOURCE: ${{ needs.resolve-registry-cache-refs.outputs.source }}
+      CACHE_DESTINATION: ${{ needs.resolve-registry-cache-refs.outputs.destination }}
+      BRANCH_IMAGE_TAG: ${{ needs.resolve-registry-cache-refs.outputs.branch_tag }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to Erato Labs registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ERATOLABS_REGISTRY_USERNAME }}
+          password: ${{ secrets.ERATOLABS_REGISTRY_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6.15.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/arm64
+          tags: |
+            ${{ env.PUBLISH_LATEST == 'true' && format('{0}/{1}:latest-arm64', env.REGISTRY, env.IMAGE_NAME) || '' }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.SHA_TAG }}-arm64
+            ${{ env.BRANCH_IMAGE_TAG != '' && format('{0}/{1}:{2}-arm64', env.REGISTRY, env.IMAGE_NAME, env.BRANCH_IMAGE_TAG) || '' }}
+            ${{ env.RELEASE_VERSION != '' && format('{0}/{1}:{2}-arm64', env.REGISTRY, env.IMAGE_NAME, env.RELEASE_VERSION) || '' }}
+          cache-from: |
+            type=registry,image-manifest=true,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.CACHE_TARGET }}-arm64-buildcache
+            ${{ env.CACHE_SOURCE != '' && format('type=registry,image-manifest=true,ref={0}/{1}:{2}-arm64-buildcache', env.REGISTRY, env.IMAGE_NAME, env.CACHE_SOURCE) || '' }}
+            ${{ env.CACHE_TARGET != 'main' && format('type=registry,image-manifest=true,ref={0}/{1}:main-arm64-buildcache', env.REGISTRY, env.IMAGE_NAME) || '' }}
+          cache-to: type=registry,image-manifest=true,mode=max,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.CACHE_DESTINATION }}-arm64-buildcache
+
+  create-manifests:
+    if: github.event_name == 'push'
+    needs: [resolve-registry-cache-refs, build-and-push-amd64, build-and-push-arm64]
+    runs-on: ubuntu-24.04
+    env:
+      BRANCH_IMAGE_TAG: ${{ needs.resolve-registry-cache-refs.outputs.branch_tag }}
+    steps:
+      - name: Log in to Erato Labs registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ERATOLABS_REGISTRY_USERNAME }}
+          password: ${{ secrets.ERATOLABS_REGISTRY_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push manifests
+        run: |
+          if [[ "${{ env.PUBLISH_LATEST }}" == "true" ]]; then
+            docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-amd64 \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-arm64
+          fi
+
+          docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.SHA_TAG }} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.SHA_TAG }}-amd64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.SHA_TAG }}-arm64
+
+          if [[ "${{ env.BRANCH_IMAGE_TAG }}" != "" ]]; then
+            docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BRANCH_IMAGE_TAG }} \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BRANCH_IMAGE_TAG }}-amd64 \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BRANCH_IMAGE_TAG }}-arm64
+          fi
+
+          if [[ "${{ env.RELEASE_VERSION }}" != "" ]]; then
+            docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.RELEASE_VERSION }} \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.RELEASE_VERSION }}-amd64 \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.RELEASE_VERSION }}-arm64
+          fi
+
+  create-github-release:
+    needs: [create-manifests]
+    runs-on: ubuntu-24.04
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate release notes
+        id: generate_notes
+        run: |
+          NOTES="## Code Interpreter MCP - Release ${{ github.ref_name }}
+
+          ### Docker Image
+
+          Pull the Docker image for this release:
+
+          \`\`\`bash
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          \`\`\`
+
+          Multi-architecture support: amd64, arm64
+
+          ### Changes
+
+          See the commit history for details on what changed in this release.
+
+          ### Registry Information
+
+          - **Registry**: ${{ env.REGISTRY }}
+          - **Image**: ${{ env.IMAGE_NAME }}
+          - **Tag**: ${{ github.ref_name }}
+          "
+
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "body<<$EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "$EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.generate_notes.outputs.body }}
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
