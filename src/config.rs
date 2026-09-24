@@ -15,6 +15,14 @@ pub struct AppConfig {
     pub bind_addr: String,
     pub allowed_hosts: Option<Vec<String>>,
     pub asset_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub preinstall_packages: Vec<String>,
+    #[serde(default = "default_runtime_package_installation")]
+    pub runtime_package_installation: bool,
+}
+
+fn default_runtime_package_installation() -> bool {
+    true
 }
 
 fn default_bind_address() -> String {
@@ -45,7 +53,7 @@ impl AppConfig {
     fn from_files(paths: &[PathBuf]) -> Result<Self> {
         let mut merged = toml::Value::Table(Default::default());
         for path in paths {
-            let source = fs::read_to_string(&path)
+            let source = fs::read_to_string(path)
                 .with_context(|| format!("failed to read config file {}", path.display()))?;
             let value = toml::from_str::<toml::Value>(&source)
                 .with_context(|| format!("invalid TOML in {}", path.display()))?;
@@ -119,6 +127,24 @@ fn merge(base: &mut toml::Value, incoming: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_policy_defaults_and_overrides() {
+        let defaults = AppConfig::from_files(&[]).unwrap();
+        assert!(defaults.runtime_package_installation);
+        assert!(defaults.preinstall_packages.is_empty());
+        let mut base: toml::Value = toml::from_str(
+            "preinstall_packages = ['numpy', 'pandas']\nruntime_package_installation = true",
+        )
+        .unwrap();
+        merge(&mut base, toml::from_str(
+            "preinstall_packages = ['snowballstemmer==3.0.1']\nruntime_package_installation = false"
+        ).unwrap());
+        let config: AppConfig = base.try_into().unwrap();
+        assert!(!config.runtime_package_installation);
+        assert_eq!(config.preinstall_packages, ["snowballstemmer==3.0.1"]);
+        assert!(toml::from_str::<AppConfig>("runtime_package_installation = 'false'").is_err());
+    }
 
     #[test]
     fn merges_nested_tables_and_replaces_values() {

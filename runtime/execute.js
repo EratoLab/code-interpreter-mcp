@@ -114,7 +114,9 @@ function collectCreatedFiles(FS, initialFiles) {
       listWorkspaceFiles(pyodide.FS).map((file) => file.path),
     );
 
-    await pyodide.loadPackagesFromImports(request.code);
+    if (globalThis.__packagePolicy.runtime_package_installation) {
+      await pyodide.loadPackagesFromImports(request.code);
+    }
     globalThis.__resetCapture();
 
     const value = await pyodide.runPythonAsync(request.code, {
