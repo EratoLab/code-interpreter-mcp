@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    env,
     io::{self, Write},
     net::SocketAddr,
     path::{Component, Path},
@@ -20,6 +19,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 mod runtime;
+use code_interpreter_mcp::config::AppConfig;
 use runtime::PyodideRuntime;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -28,7 +28,6 @@ const MAX_CODE_BYTES: usize = 1024 * 1024;
 const MAX_FILES: usize = 64;
 const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOTAL_FILE_BYTES: usize = 50 * 1024 * 1024;
-const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8000";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RunPythonCodeRequest {
@@ -153,9 +152,9 @@ struct CodeInterpreterMcpServer {
 
 #[tool_router]
 impl CodeInterpreterMcpServer {
-    fn new() -> Self {
+    fn new(config: &AppConfig) -> Self {
         Self {
-            runtime: PyodideRuntime::new(),
+            runtime: PyodideRuntime::new(config),
         }
     }
 
@@ -261,13 +260,13 @@ fn validate_relative_path(value: &str) -> Result<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let configured_address = env::var("CODE_INTERPRETER_MCP_BIND_ADDR")
-        .unwrap_or_else(|_| DEFAULT_BIND_ADDRESS.to_owned());
-    let bind_address: SocketAddr = configured_address
+    let config = AppConfig::load()?;
+    let bind_address: SocketAddr = config
+        .bind_addr
         .parse()
-        .with_context(|| format!("invalid CODE_INTERPRETER_MCP_BIND_ADDR: {configured_address}"))?;
+        .with_context(|| format!("invalid bind_addr: {}", config.bind_addr))?;
 
-    let server = CodeInterpreterMcpServer::new();
+    let server = CodeInterpreterMcpServer::new(&config);
     let http_service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),

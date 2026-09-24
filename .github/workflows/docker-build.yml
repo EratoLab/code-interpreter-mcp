@@ -8,6 +8,7 @@ on:
     paths:
       - '.github/workflows/docker-build.yml'
       - 'src/**'
+      - 'generated/**'
       - 'runtime/**'
       - 'Dockerfile'
       - '.dockerignore'
@@ -20,6 +21,7 @@ on:
     paths:
       - '.github/workflows/docker-build.yml'
       - 'src/**'
+      - 'generated/**'
       - 'runtime/**'
       - 'Dockerfile'
       - '.dockerignore'
@@ -122,6 +124,9 @@ jobs:
 
       - name: "Run tests"
         run: cargo test --all-features --locked
+
+      - name: "Check config reference is up to date"
+        run: cargo run --locked --bin gen-config-reference -- --check
 
   build-and-push-amd64:
     if: github.event_name == 'push'

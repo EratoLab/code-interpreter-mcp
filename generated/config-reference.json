@@ -1,0 +1,5 @@
+{
+  "allowed_hosts.[]": {},
+  "asset_dir": {},
+  "bind_addr": {}
+}
