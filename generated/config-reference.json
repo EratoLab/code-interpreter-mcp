@@ -1,5 +1,7 @@
 {
   "allowed_hosts.[]": {},
   "asset_dir": {},
-  "bind_addr": {}
+  "bind_addr": {},
+  "preinstall_packages.[]": {},
+  "runtime_package_installation": {}
 }

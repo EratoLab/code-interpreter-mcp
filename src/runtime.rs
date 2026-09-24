@@ -25,14 +25,31 @@ struct RuntimeConfig {
     client: reqwest::Client,
     download_cache: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
     content_types: Arc<Mutex<HashMap<String, String>>>,
+    preinstall_packages: Vec<String>,
+    runtime_package_installation: bool,
 }
+
+struct UserExecutionStarted(bool);
 
 #[op2]
 async fn op_fetch_url(
     state: Rc<RefCell<OpState>>,
     #[string] raw_url: String,
 ) -> Result<Uint8Array, JsErrorBox> {
-    let config = state.borrow().borrow::<RuntimeConfig>().clone();
+    let config = {
+        let state = state.borrow();
+        if state.borrow::<UserExecutionStarted>().0
+            && !state.borrow::<RuntimeConfig>().runtime_package_installation
+        {
+            return Err(JsErrorBox::generic(
+                "Runtime package installation is disabled; sandbox downloads are disabled after preinstallation",
+            ));
+        }
+        state.borrow::<RuntimeConfig>().clone()
+    };
+    if !state.borrow().borrow::<UserExecutionStarted>().0 {
+        eprintln!("Python packages: initialization fetching {raw_url} (may use cached artifact)");
+    }
     let bytes = fetch_url(&config, &raw_url)
         .await
         .map_err(|error| JsErrorBox::generic(format!("Sandbox fetch failed: {error:#}")))?;
@@ -53,6 +70,11 @@ fn op_fetch_content_type(state: &OpState, #[string] raw_url: String) -> String {
 }
 
 #[op2(fast)]
+fn op_package_log(#[string] message: String) {
+    eprintln!("Python packages: {message}");
+}
+
+#[op2(fast)]
 fn op_random_fill(#[buffer] output: &mut [u8]) -> Result<(), JsErrorBox> {
     getrandom::fill(output)
         .map_err(|error| JsErrorBox::generic(format!("OS randomness failed: {error}")))
@@ -61,11 +83,12 @@ fn op_random_fill(#[buffer] output: &mut [u8]) -> Result<(), JsErrorBox> {
 deno_core::extension!(
     pyodide_host,
     deps = [deno_webidl, deno_web],
-    ops = [op_fetch_url, op_fetch_content_type, op_random_fill],
+    ops = [op_fetch_url, op_fetch_content_type, op_random_fill, op_package_log],
     js = [dir "runtime", "bootstrap.js"],
     options = { config: RuntimeConfig },
     state = |state, options| {
         state.put(options.config);
+        state.put(UserExecutionStarted(false)); // User execution has not started.
     },
 );
 
@@ -105,6 +128,8 @@ impl PyodideRuntime {
 
         Self {
             config: RuntimeConfig {
+                preinstall_packages: config.preinstall_packages.clone(),
+                runtime_package_installation: config.runtime_package_installation,
                 allowed_hosts: Arc::new(allowed_hosts),
                 asset_dir: Arc::new(asset_dir),
                 client,
@@ -181,7 +206,7 @@ async fn execute_async(
         }
     });
 
-    let result = run_pyodide(&mut runtime, &request, &config.asset_dir).await;
+    let result = run_pyodide(&mut runtime, &request, &config).await;
     let _ = finished_tx.send(());
     let _ = watchdog.join();
     result
@@ -190,8 +215,17 @@ async fn execute_async(
 async fn run_pyodide(
     runtime: &mut JsRuntime,
     request: &RuntimeRequest,
-    asset_dir: &Path,
+    config: &RuntimeConfig,
 ) -> Result<RunPythonCodeOutput> {
+    let asset_dir = &config.asset_dir;
+    let policy = serde_json::json!({
+        "preinstall_packages": config.preinstall_packages,
+        "runtime_package_installation": config.runtime_package_installation,
+    });
+    runtime.execute_script(
+        "<package_policy>",
+        format!("globalThis.__packagePolicy = {policy};"),
+    )?;
     let asm_source = patched_asm_source(asset_dir)?;
     runtime
         .execute_script("<pyodide.asm.mjs>", asm_source)
@@ -216,7 +250,12 @@ async fn run_pyodide(
     runtime
         .resolve_value(initialization)
         .await
-        .context("could not initialize Pyodide and micropip")?;
+        .context("could not initialize Pyodide and preinstall configured packages")?;
+
+    runtime
+        .op_state()
+        .borrow_mut()
+        .put(UserExecutionStarted(true));
 
     let request_json = serde_json::to_string(request).context("could not serialize request")?;
     let quoted_json =
@@ -393,4 +432,83 @@ async fn fetch_url(config: &RuntimeConfig, raw_url: &str) -> Result<Arc<Vec<u8>>
         .expect("content-type cache mutex was poisoned")
         .insert(raw_url.to_owned(), content_type);
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn run(runtime: &PyodideRuntime, code: &str) -> RunPythonCodeOutput {
+        runtime
+            .execute(RuntimeRequest {
+                code: code.to_owned(),
+                files: Vec::new(),
+                timeout_ms: 120_000,
+            })
+            .await
+    }
+
+    // These exercise real Pyodide and need npm assets and package-download access.
+    #[tokio::test]
+    #[ignore = "requires npm ci and HTTPS package downloads"]
+    async fn package_policy_in_fresh_sandboxes() {
+        let config: AppConfig =
+            toml::from_str("preinstall_packages = ['pandas', 'snowballstemmer==3.0.1']\nruntime_package_installation = false")
+                .unwrap();
+        let runtime = PyodideRuntime::new(&config);
+        for _ in 0..2 {
+            let output = run(
+                &runtime,
+                "import pandas, numpy, snowballstemmer, json\nprint(numpy.arange(3).sum())",
+            )
+            .await;
+            assert!(output.success, "{output:?}");
+            assert_eq!(output.stdout, "3\n");
+        }
+        for code in [
+            "import scipy",
+            "import micropip\nawait micropip.install('snowballstemmer')",
+            "import importlib, micropip\nimportlib.reload(micropip)\nawait micropip.install('snowballstemmer')",
+            "import sys, micropip\ndel sys.modules['micropip']\nimport micropip\nawait micropip.install('snowballstemmer')",
+            "import pyodide_js\nawait pyodide_js.loadPackage('scipy')",
+            "from pyodide.http import pyfetch\nawait pyfetch('https://pypi.org/simple/snowballstemmer/')",
+        ] {
+            let output = run(&runtime, code).await;
+            assert!(!output.success, "{code}: {output:?}");
+            assert!(!output.timed_out, "{output:?}");
+            let message = &output.error.as_ref().unwrap().message;
+            assert!(
+                message.contains("disabled")
+                    || output
+                        .error
+                        .as_ref()
+                        .unwrap()
+                        .traceback
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("No module named 'scipy'"),
+                "{output:?}"
+            );
+        }
+        for source in ["", "runtime_package_installation = true"] {
+            let config: AppConfig = toml::from_str(source).unwrap();
+            let runtime = PyodideRuntime::new(&config);
+            let output = run(&runtime, "import numpy\nimport micropip\nawait micropip.install('snowballstemmer')\nimport snowballstemmer\nprint(numpy.arange(3).sum())").await;
+            assert!(output.success, "{output:?}");
+            assert_eq!(output.stdout, "3\n");
+        }
+        let config: AppConfig =
+            toml::from_str("preinstall_packages = ['this-package-does-not-exist-ermcp20']")
+                .unwrap();
+        let output = run(&PyodideRuntime::new(&config), "print('must not run')").await;
+        assert!(!output.success, "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            output
+                .error
+                .unwrap()
+                .message
+                .contains("this-package-does-not-exist-ermcp20")
+        );
+    }
 }

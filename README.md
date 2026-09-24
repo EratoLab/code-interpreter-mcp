@@ -106,7 +106,8 @@ frame.loc[frame["value"] > 1].to_csv("results.csv", index=False)
 
 ### pandas and Pyodide packages
 
-Imports recognized by Pyodide are loaded automatically:
+With runtime package installation enabled (the default), imports recognized by
+Pyodide are loaded automatically:
 
 ```python
 import pandas as pd
@@ -114,6 +115,36 @@ import pandas as pd
 frame = pd.DataFrame({"value": [1, 2, 3]})
 frame["value"].sum()
 ```
+
+### Package preinstallation and installation policy
+
+```toml
+preinstall_packages = ["pandas", "snowballstemmer==3.0.1"]
+runtime_package_installation = false
+```
+
+`preinstall_packages` defaults to `[]`. It accepts micropip-compatible package
+requirements (including version constraints and compatible wheel URLs). Packages
+and their required dependencies are installed before user code in **every fresh
+sandbox**. Artifacts are cached in server memory, but installed Python state is
+never shared between calls. Preinstallation counts toward the request timeout.
+Progress, package names, completion, and diagnostic failures are logged to server
+stderr. Installation failures return a runtime initialization error without
+executing user code. Later config files replace the entire package list.
+
+`runtime_package_installation` defaults to `true`. When enabled, recognized
+imports and explicit `micropip.install` calls retain their normal behavior. When
+`false`, automatic package loading is skipped; the standard library and packages
+installed during initialization (including dependencies) remain available. An
+unavailable import fails with a Python import error. `micropip.install` raises
+`RuntimeError: Runtime package installation is disabled`, even after reimporting
+or reloading micropip. Pyodide package-loading APIs are also disabled.
+
+In disabled mode, sandbox HTTPS downloads are blocked after initialization,
+including cached downloads, to prevent alternate download-based installers.
+Preinstallation still uses the configured HTTPS host allowlist. This is a package
+installation policy, not a restriction on executing Python source supplied in
+the request or its input files.
 
 ### micropip
 
@@ -202,5 +233,7 @@ limits.
 ```bash
 cargo fmt --check
 cargo test
+# Integration coverage requires npm assets and HTTPS package access:
+cargo test package_policy_in_fresh_sandboxes -- --ignored --nocapture
 cargo clippy --all-targets --all-features -- -D warnings
 ```
