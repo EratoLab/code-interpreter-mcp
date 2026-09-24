@@ -1,7 +1,6 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    env,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex, mpsc},
@@ -13,6 +12,7 @@ use deno_core::{JsRuntime, OpState, RuntimeOptions, convert::Uint8Array, op2, ur
 use deno_error::JsErrorBox;
 
 use crate::{RunPythonCodeOutput, RuntimeRequest};
+use code_interpreter_mcp::config::AppConfig;
 
 const PYODIDE_ORIGIN: &str = "pyodide.local";
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
@@ -75,10 +75,13 @@ pub(crate) struct PyodideRuntime {
 }
 
 impl PyodideRuntime {
-    pub(crate) fn new() -> Self {
-        let mut allowed_hosts = env::var("CODE_INTERPRETER_MCP_ALLOWED_HOSTS")
-            .unwrap_or_default()
-            .split(',')
+    pub(crate) fn new(config: &AppConfig) -> Self {
+        let mut allowed_hosts = config
+            .allowed_hosts
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(String::as_str)
             .map(|host| host.trim().to_ascii_lowercase())
             .filter(|host| !host.is_empty())
             .collect::<HashSet<_>>();
@@ -90,11 +93,9 @@ impl PyodideRuntime {
             ]);
         }
 
-        let asset_dir = env::var_os("CODE_INTERPRETER_MCP_ASSET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("node_modules/pyodide")
-            });
+        let asset_dir = config.asset_dir.clone().unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("node_modules/pyodide")
+        });
 
         let client = reqwest::Client::builder()
             .user_agent(concat!("code-interpreter-mcp/", env!("CARGO_PKG_VERSION")))

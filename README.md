@@ -134,7 +134,23 @@ repository.
 
 ## Configuration and limits
 
-Environment variables:
+The server reads `code-interpreter-mcp.toml` and every
+`*.auto.code-interpreter-mcp.toml` file in its current working directory.
+Matching files are loaded in filename order. Values in later files override
+earlier values; TOML tables are merged by key and arrays are replaced.
+To use a specific ordered list instead, pass `--config path/to/file.toml` more
+than once. An explicit list disables discovery, and every listed file must exist.
+
+For example, `code-interpreter-mcp.toml` can contain:
+
+```toml
+bind_addr = "127.0.0.1:8000"
+allowed_hosts = ["cdn.jsdelivr.net", "pypi.org", "files.pythonhosted.org"]
+asset_dir = "/app/node_modules/pyodide"
+```
+
+All settings are optional. The existing environment variables override values
+from configuration files:
 
 - `CODE_INTERPRETER_MCP_BIND_ADDR`: HTTP socket address. Defaults to `127.0.0.1:8000`.
   Use `127.0.0.1:0` to let the operating system select a free port; the
@@ -143,6 +159,11 @@ Environment variables:
   `cdn.jsdelivr.net,pypi.org,files.pythonhosted.org`. Subdomains are accepted.
 - `CODE_INTERPRETER_MCP_ASSET_DIR`: overrides the local Pyodide asset directory. It must
   contain the files installed by the pinned `pyodide` npm package.
+
+The committed [configuration key reference](generated/config-reference.json)
+is generated from `AppConfig` with `facet`. After changing its fields, run
+`cargo run --bin gen-config-reference` and commit the updated JSON. CI runs
+the generator with `--check`.
 
 Per request limits:
 
