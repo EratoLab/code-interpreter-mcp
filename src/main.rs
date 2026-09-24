@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashSet,
     io::{self, Write},
     net::SocketAddr,
@@ -11,6 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
     Json, ServerHandler,
     handler::server::wrapper::Parameters,
+    model::ProtocolVersion,
     schemars, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
@@ -181,7 +183,18 @@ impl CodeInterpreterMcpServer {
     version = "0.1.0",
     instructions = "Use run_python_code to execute Python in a fresh Pyodide WebAssembly sandbox."
 )]
-impl ServerHandler for CodeInterpreterMcpServer {}
+impl ServerHandler for CodeInterpreterMcpServer {
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        // This endpoint implements Streamable HTTP's initialize lifecycle.
+        // 2024-11-05 uses the superseded HTTP+SSE transport, while 2026-07-28
+        // removes initialize and requires per-request protocol metadata.
+        Cow::Borrowed(&[
+            ProtocolVersion::V_2025_03_26,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_11_25,
+        ])
+    }
+}
 
 fn validate_request(request: RunPythonCodeRequest) -> Result<RuntimeRequest> {
     if request.code.len() > MAX_CODE_BYTES {

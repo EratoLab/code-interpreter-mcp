@@ -45,7 +45,7 @@ impl AppConfig {
     fn from_files(paths: &[PathBuf]) -> Result<Self> {
         let mut merged = toml::Value::Table(Default::default());
         for path in paths {
-            let source = fs::read_to_string(&path)
+            let source = fs::read_to_string(path)
                 .with_context(|| format!("failed to read config file {}", path.display()))?;
             let value = toml::from_str::<toml::Value>(&source)
                 .with_context(|| format!("invalid TOML in {}", path.display()))?;
