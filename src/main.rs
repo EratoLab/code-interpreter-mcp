@@ -11,6 +11,7 @@ use axum::Router;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
     Json, ServerHandler,
+    handler::server::tool::ToolRouter,
     handler::server::wrapper::Parameters,
     model::ProtocolVersion,
     schemars, tool, tool_handler, tool_router,
@@ -21,7 +22,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 mod runtime;
-use code_interpreter_mcp::config::AppConfig;
+use code_interpreter_mcp::config::{AppConfig, CodeSnippetsConfig};
 use runtime::PyodideRuntime;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -150,13 +151,35 @@ pub(crate) struct ValidatedFile {
 #[derive(Clone)]
 struct CodeInterpreterMcpServer {
     runtime: PyodideRuntime,
+    code_snippets: CodeSnippetsConfig,
+    tool_router: ToolRouter<Self>,
 }
 
-#[tool_router]
+#[tool_router(router = tool_router)]
 impl CodeInterpreterMcpServer {
     fn new(config: &AppConfig) -> Self {
+        let code_snippets = CodeSnippetsConfig {
+            enabled: config.code_snippets.enabled,
+            snippets: config
+                .code_snippets
+                .snippets
+                .iter()
+                .filter(|(id, _)| snippet_is_included(id, &config.code_snippets))
+                .map(|(id, snippet)| (id.clone(), snippet.clone()))
+                .collect(),
+            include_snippet_ids: Vec::new(),
+            include_snippet_tags: Vec::new(),
+            exclude_snippet_ids: Vec::new(),
+        };
+        let mut tool_router = Self::tool_router();
+        if !config.code_snippets.enabled {
+            tool_router.disable_route("list_code_snippets");
+            tool_router.disable_route("get_code_snippet");
+        }
         Self {
             runtime: PyodideRuntime::new(config),
+            code_snippets,
+            tool_router,
         }
     }
 
@@ -176,9 +199,67 @@ impl CodeInterpreterMcpServer {
 
         Json(self.runtime.execute(request).await)
     }
+
+    #[tool(
+        description = "List configured code snippets by ID, title, description, tags, and required Python packages. Search matches title and description without returning the code."
+    )]
+    fn list_code_snippets(
+        &self,
+        Parameters(request): Parameters<ListCodeSnippetsRequest>,
+    ) -> Json<ListCodeSnippetsOutput> {
+        let search = request
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let snippets = self
+            .code_snippets
+            .snippets
+            .iter()
+            .filter(|(_, snippet)| {
+                search.is_none_or(|query| {
+                    snippet.title.to_lowercase().contains(&query.to_lowercase())
+                        || snippet
+                            .description
+                            .to_lowercase()
+                            .contains(&query.to_lowercase())
+                })
+            })
+            .map(|(id, snippet)| CodeSnippetSummary {
+                id: id.clone(),
+                title: snippet.title.clone(),
+                description: snippet.description.clone(),
+                required_python_packages: snippet.required_python_packages.clone(),
+                tags: snippet.tags.clone(),
+            })
+            .collect();
+        Json(ListCodeSnippetsOutput { snippets })
+    }
+
+    #[tool(
+        description = "Return the full metadata and Python source for a configured code snippet by its ID."
+    )]
+    fn get_code_snippet(
+        &self,
+        Parameters(request): Parameters<GetCodeSnippetRequest>,
+    ) -> Json<GetCodeSnippetOutput> {
+        let snippet =
+            self.code_snippets
+                .snippets
+                .get(&request.id)
+                .map(|snippet| CodeSnippetDetails {
+                    id: request.id,
+                    title: snippet.title.clone(),
+                    description: snippet.description.clone(),
+                    required_python_packages: snippet.required_python_packages.clone(),
+                    tags: snippet.tags.clone(),
+                    code_snippet: snippet.code_snippet.clone(),
+                });
+        Json(GetCodeSnippetOutput { snippet })
+    }
 }
 
-#[tool_handler(
+#[tool_handler(router = self.tool_router,
     name = "code-interpreter-mcp",
     version = "0.1.0",
     instructions = "Use run_python_code to execute Python in a fresh Pyodide WebAssembly sandbox."
@@ -194,6 +275,71 @@ impl ServerHandler for CodeInterpreterMcpServer {
             ProtocolVersion::V_2025_11_25,
         ])
     }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListCodeSnippetsRequest {
+    /// Optional case-insensitive search over snippet titles and descriptions.
+    search: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct ListCodeSnippetsOutput {
+    snippets: Vec<CodeSnippetSummary>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct CodeSnippetSummary {
+    id: String,
+    title: String,
+    description: String,
+    required_python_packages: Vec<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GetCodeSnippetRequest {
+    /// Configured snippet ID.
+    id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct GetCodeSnippetOutput {
+    /// Null when no configured snippet has this ID.
+    snippet: Option<CodeSnippetDetails>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct CodeSnippetDetails {
+    id: String,
+    title: String,
+    description: String,
+    required_python_packages: Vec<String>,
+    tags: Vec<String>,
+    code_snippet: String,
+}
+
+fn snippet_is_included(id: &str, config: &CodeSnippetsConfig) -> bool {
+    if config
+        .exclude_snippet_ids
+        .iter()
+        .any(|excluded| excluded == id)
+    {
+        return false;
+    }
+    let has_include_filter =
+        !config.include_snippet_ids.is_empty() || !config.include_snippet_tags.is_empty();
+    !has_include_filter
+        || config
+            .include_snippet_ids
+            .iter()
+            .any(|included| included == id)
+        || config.snippets.get(id).is_some_and(|snippet| {
+            snippet
+                .tags
+                .iter()
+                .any(|tag| config.include_snippet_tags.contains(tag))
+        })
 }
 
 fn validate_request(request: RunPythonCodeRequest) -> Result<RuntimeRequest> {

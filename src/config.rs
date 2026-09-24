@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
 };
@@ -9,7 +10,7 @@ use serde::Deserialize;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8000";
 
-#[derive(Debug, Deserialize, Facet)]
+#[derive(Debug, Clone, Deserialize, Facet)]
 pub struct AppConfig {
     #[serde(default = "default_bind_address")]
     pub bind_addr: String,
@@ -19,6 +20,35 @@ pub struct AppConfig {
     pub preinstall_packages: Vec<String>,
     #[serde(default = "default_runtime_package_installation")]
     pub runtime_package_installation: bool,
+    #[serde(default)]
+    pub code_snippets: CodeSnippetsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Facet)]
+#[serde(default)]
+pub struct CodeSnippetsConfig {
+    #[serde(default = "default_code_snippets_enabled")]
+    pub enabled: bool,
+    pub snippets: BTreeMap<String, CodeSnippet>,
+    pub include_snippet_ids: Vec<String>,
+    pub include_snippet_tags: Vec<String>,
+    pub exclude_snippet_ids: Vec<String>,
+}
+
+fn default_code_snippets_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Facet)]
+pub struct CodeSnippet {
+    pub title: String,
+    #[serde(alias = "descripton")]
+    pub description: String,
+    #[serde(default)]
+    pub required_python_packages: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    pub code_snippet: String,
 }
 
 fn default_runtime_package_installation() -> bool {
@@ -62,6 +92,18 @@ impl AppConfig {
         merged
             .try_into()
             .context("invalid code-interpreter-mcp configuration")
+    }
+}
+
+impl Default for CodeSnippetsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            snippets: BTreeMap::new(),
+            include_snippet_ids: Vec::new(),
+            include_snippet_tags: Vec::new(),
+            exclude_snippet_ids: Vec::new(),
+        }
     }
 }
 
