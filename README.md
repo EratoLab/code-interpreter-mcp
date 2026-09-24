@@ -146,6 +146,36 @@ Preinstallation still uses the configured HTTPS host allowlist. This is a packag
 installation policy, not a restriction on executing Python source supplied in
 the request or its input files.
 
+### Configured code snippets
+
+The server can expose configured Python snippets through `list_code_snippets`
+and `get_code_snippet`. Listing returns snippet IDs and descriptive metadata;
+search is case-insensitive and checks titles and descriptions. Getting a snippet
+by ID returns its full metadata and source code. Snippets are sorted by ID.
+
+```toml
+[code_snippets]
+enabled = true
+include_snippet_ids = []
+include_snippet_tags = []
+exclude_snippet_ids = []
+
+[code_snippets.snippets.convert_docx_to_pdf]
+title = "Convert DOCX to PDF"
+description = "Takes a DOCX file as input and converts it to a PDF"
+required_python_packages = ["magical_docx_to_pdf"]
+tags = ["provider_eratolabs"]
+code_snippet = '''
+import magical_docx_to_pdf
+# Convert the input document.
+'''
+```
+
+Both snippet tools are enabled by default and can be hidden with
+`enabled = false`. If either include list is non-empty, a snippet is included
+when its ID is listed or it has at least one listed tag. Excluded IDs take
+precedence. `required_python_packages` and `tags` default to empty lists.
+
 ### micropip
 
 `micropip` is preloaded, so compatible pure-Python or Wasm wheels may be

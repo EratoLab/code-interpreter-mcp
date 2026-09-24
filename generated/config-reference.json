@@ -2,6 +2,15 @@
   "allowed_hosts.[]": {},
   "asset_dir": {},
   "bind_addr": {},
+  "code_snippets.enabled": {},
+  "code_snippets.exclude_snippet_ids.[]": {},
+  "code_snippets.include_snippet_ids.[]": {},
+  "code_snippets.include_snippet_tags.[]": {},
+  "code_snippets.snippets.<key>.code_snippet": {},
+  "code_snippets.snippets.<key>.description": {},
+  "code_snippets.snippets.<key>.required_python_packages.[]": {},
+  "code_snippets.snippets.<key>.tags.[]": {},
+  "code_snippets.snippets.<key>.title": {},
   "preinstall_packages.[]": {},
   "runtime_package_installation": {}
 }
