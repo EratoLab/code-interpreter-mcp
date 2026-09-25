@@ -15,6 +15,10 @@ pub struct AppConfig {
     #[serde(default = "default_bind_address")]
     pub bind_addr: String,
     pub allowed_hosts: Option<Vec<String>>,
+    #[serde(default)]
+    pub http_allowed_hosts: Vec<String>,
+    #[serde(default)]
+    pub skip_host_header_verification: bool,
     pub asset_dir: Option<PathBuf>,
     #[serde(default)]
     pub preinstall_packages: Vec<String>,
@@ -76,6 +80,19 @@ impl AppConfig {
         }
         if let Some(value) = env::var_os("CODE_INTERPRETER_MCP_ASSET_DIR") {
             config.asset_dir = Some(PathBuf::from(value));
+        }
+        if let Ok(value) = env::var("CODE_INTERPRETER_MCP_HTTP_ALLOWED_HOSTS") {
+            config.http_allowed_hosts = value
+                .split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+        if let Ok(value) = env::var("CODE_INTERPRETER_MCP_SKIP_HOST_HEADER_VERIFICATION") {
+            config.skip_host_header_verification = value.parse().context(
+                "CODE_INTERPRETER_MCP_SKIP_HOST_HEADER_VERIFICATION must be true or false",
+            )?;
         }
         Ok(config)
     }
@@ -169,6 +186,30 @@ fn merge(base: &mut toml::Value, incoming: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_header_settings_default_and_merge_independently_of_package_hosts() {
+        let defaults = AppConfig::from_files(&[]).unwrap();
+        assert!(defaults.http_allowed_hosts.is_empty());
+        assert!(!defaults.skip_host_header_verification);
+        let mut base = toml::from_str::<toml::Value>(
+            "allowed_hosts = ['pypi.org']\nhttp_allowed_hosts = ['old.example.com']",
+        )
+        .unwrap();
+        merge(
+            &mut base,
+            toml::from_str(
+                "http_allowed_hosts = ['mcp.example.com:8000']\nskip_host_header_verification = true",
+            )
+            .unwrap(),
+        );
+        let config: AppConfig = base.try_into().unwrap();
+        assert_eq!(config.allowed_hosts.unwrap(), ["pypi.org"]);
+        assert_eq!(config.http_allowed_hosts, ["mcp.example.com:8000"]);
+        assert!(config.skip_host_header_verification);
+        assert!(toml::from_str::<AppConfig>("http_allowed_hosts = 'example.com'").is_err());
+        assert!(toml::from_str::<AppConfig>("skip_host_header_verification = 'true'").is_err());
+    }
 
     #[test]
     fn package_policy_defaults_and_overrides() {

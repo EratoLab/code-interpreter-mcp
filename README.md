@@ -220,6 +220,30 @@ from configuration files:
   `cdn.jsdelivr.net,pypi.org,files.pythonhosted.org`. Subdomains are accepted.
 - `CODE_INTERPRETER_MCP_ASSET_DIR`: overrides the local Pyodide asset directory. It must
   contain the files installed by the pinned `pyodide` npm package.
+- `CODE_INTERPRETER_MCP_HTTP_ALLOWED_HOSTS`: comma-separated inbound HTTP Host
+  allowlist, overriding `http_allowed_hosts`. Whitespace and empty entries are ignored.
+- `CODE_INTERPRETER_MCP_SKIP_HOST_HEADER_VERIFICATION`: `true` or `false`, overriding
+  `skip_host_header_verification` (default `false`).
+
+### HTTP Host header verification
+
+Streamable HTTP verifies the inbound `Host` header by default, allowing only
+`localhost`, `127.0.0.1`, and `::1` on any port. For a public hostname or reverse
+proxy, configure the hosts that clients or the proxy send to this server:
+
+```toml
+http_allowed_hosts = ["mcp.example.com", "proxy.example.com:8443"]
+skip_host_header_verification = false
+```
+
+A non-empty `http_allowed_hosts` list replaces the default loopback allowlist.
+A hostname permits any port; a `host:port` entry permits only that port. Omitted
+or empty lists retain the loopback defaults. These settings are independent of
+`bind_addr` and the outbound HTTPS package download `allowed_hosts` setting.
+
+Set `skip_host_header_verification = true` to allow any inbound Host value,
+even when `http_allowed_hosts` is configured. This disables the Host allowlist
+protection against DNS rebinding and is not recommended for public deployments.
 
 The committed [configuration key reference](generated/config-reference.json)
 is generated from `AppConfig` with `facet`. After changing its fields, run
