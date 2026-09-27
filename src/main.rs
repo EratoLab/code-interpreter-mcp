@@ -417,6 +417,17 @@ fn validate_relative_path(value: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
+fn http_server_config(config: &AppConfig) -> StreamableHttpServerConfig {
+    let http_config = StreamableHttpServerConfig::default();
+    if config.skip_host_header_verification {
+        http_config.disable_allowed_hosts()
+    } else if config.http_allowed_hosts.is_empty() {
+        http_config
+    } else {
+        http_config.with_allowed_hosts(config.http_allowed_hosts.clone())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = AppConfig::load()?;
@@ -429,7 +440,7 @@ async fn main() -> Result<()> {
     let http_service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
-        StreamableHttpServerConfig::default(),
+        http_server_config(&config),
     );
     let router = Router::new().nest_service("/mcp", http_service);
     let listener = tokio::net::TcpListener::bind(bind_address)
@@ -456,6 +467,73 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[tokio::test]
+    async fn enforces_configured_http_hosts() {
+        for (settings, cases) in [
+            (
+                "",
+                vec![
+                    ("localhost:8000", true),
+                    ("127.0.0.1", true),
+                    ("[::1]:8000", true),
+                    ("mcp.example.com", false),
+                ],
+            ),
+            (
+                "http_allowed_hosts = []\nallowed_hosts = ['packages.example.com']",
+                vec![("localhost", true), ("packages.example.com", false)],
+            ),
+            (
+                "http_allowed_hosts = ['mcp.example.com', 'proxy.example.com:8443']",
+                vec![
+                    ("mcp.example.com:8000", true),
+                    ("proxy.example.com:8443", true),
+                    ("proxy.example.com:8000", false),
+                    ("localhost", false),
+                    ("evil.example.com", false),
+                ],
+            ),
+            (
+                "http_allowed_hosts = ['mcp.example.com']\nskip_host_header_verification = true",
+                vec![("unlisted.example.com:1234", true)],
+            ),
+        ] {
+            let config: AppConfig = toml::from_str(settings).unwrap();
+            let server = CodeInterpreterMcpServer::new(&config);
+            let service = StreamableHttpService::new(
+                move || Ok(server.clone()),
+                LocalSessionManager::default().into(),
+                http_server_config(&config),
+            );
+            let router = Router::new().nest_service("/mcp", service);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            for (host, allowed) in cases {
+                let response = client
+                    .post(&url)
+                    .header("Host", host)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json, text/event-stream")
+                    .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"host-test","version":"1"}}}"#)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if allowed {
+                        reqwest::StatusCode::OK
+                    } else {
+                        reqwest::StatusCode::FORBIDDEN
+                    },
+                    "Host {host} with settings {settings:?}",
+                );
+            }
+            task.abort();
+        }
+    }
 
     fn request(path: &str, data: &[u8]) -> RunPythonCodeRequest {
         RunPythonCodeRequest {

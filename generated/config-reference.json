@@ -11,6 +11,8 @@
   "code_snippets.snippets.<key>.required_python_packages.[]": {},
   "code_snippets.snippets.<key>.tags.[]": {},
   "code_snippets.snippets.<key>.title": {},
+  "http_allowed_hosts.[]": {},
   "preinstall_packages.[]": {},
-  "runtime_package_installation": {}
+  "runtime_package_installation": {},
+  "skip_host_header_verification": {}
 }
