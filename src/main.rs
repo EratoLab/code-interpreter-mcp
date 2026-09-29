@@ -64,6 +64,8 @@ pub(crate) struct RunPythonCodeOutput {
     stdout: String,
     stderr: String,
     result: Option<String>,
+    /// Omitted when the script creates no files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     files: Vec<OutputFile>,
     error: Option<ExecutionError>,
     timed_out: bool,
