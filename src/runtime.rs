@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -8,11 +9,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use deno_core::{JsRuntime, OpState, RuntimeOptions, convert::Uint8Array, op2, url::Url, v8};
+use deno_core::{
+    Extension, ExtensionFileSource, JsRuntime, OpState, RuntimeOptions, convert::Uint8Array, op2,
+    url::Url, v8,
+};
 use deno_error::JsErrorBox;
 
 use crate::{RunPythonCodeOutput, RuntimeRequest};
 use code_interpreter_mcp::config::AppConfig;
+
+include!(concat!(env!("OUT_DIR"), "/extension_sources.rs"));
 
 const PYODIDE_ORIGIN: &str = "pyodide.local";
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
@@ -182,20 +188,26 @@ async fn execute_async(
 
     let web_blob_store =
         Arc::new(deno_web::BlobStore::default()) as Arc<dyn deno_web::BlobStoreTrait>;
-    let mut runtime = JsRuntime::new(RuntimeOptions {
-        extensions: vec![
-            deno_webidl::deno_webidl::init(),
-            deno_web::deno_web::init(
-                web_blob_store,
-                Some(Url::parse("https://pyodide.local/").expect("static URL is valid")),
-                false,
-                deno_web::InMemoryBroadcastChannel::default(),
-            ),
-            pyodide_host::init(config.clone()),
-        ],
+    let extensions = vec![
+        deno_webidl::deno_webidl::init(),
+        deno_web::deno_web::init(
+            web_blob_store,
+            Some(Url::parse("https://pyodide.local/").expect("static URL is valid")),
+            false,
+            deno_web::InMemoryBroadcastChannel::default(),
+        ),
+        pyodide_host::init(config.clone()),
+    ];
+    let extensions = extensions
+        .into_iter()
+        .map(embed_extension_sources)
+        .collect::<Result<Vec<_>>>()?;
+    let mut runtime = JsRuntime::try_new(RuntimeOptions {
+        extensions,
         create_params: Some(v8::Isolate::create_params().heap_limits(0, 512 * 1024 * 1024)),
         ..Default::default()
-    });
+    })
+    .context("could not initialize the embedded Deno runtime")?;
 
     let isolate_handle = runtime.v8_isolate().thread_safe_handle();
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
@@ -210,6 +222,36 @@ async fn execute_async(
     let _ = finished_tx.send(());
     let _ = watchdog.join();
     result
+}
+
+fn embed_extension_sources(mut extension: Extension) -> Result<Extension> {
+    embed_sources(&mut extension.js_files, extension.name)?;
+    embed_sources(&mut extension.esm_files, extension.name)?;
+    embed_sources(&mut extension.lazy_loaded_esm_files, extension.name)?;
+    embed_sources(&mut extension.lazy_loaded_js_files, extension.name)?;
+    Ok(extension)
+}
+
+fn embed_sources(
+    sources: &mut Cow<'static, [ExtensionFileSource]>,
+    extension_name: &str,
+) -> Result<()> {
+    for source in sources.to_mut() {
+        if source.is_runtime_loadable() {
+            continue;
+        }
+        let code = EXTENSION_SOURCES
+            .iter()
+            .find_map(|(specifier, code)| (*specifier == source.specifier).then_some(*code))
+            .with_context(|| {
+                format!(
+                    "no embedded source was compiled for Deno extension {extension_name} file {}",
+                    source.specifier
+                )
+            })?;
+        *source = ExtensionFileSource::new_computed(source.specifier, Arc::<str>::from(code));
+    }
+    Ok(())
 }
 
 async fn run_pyodide(
