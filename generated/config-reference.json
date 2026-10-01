@@ -12,7 +12,11 @@
   "code_snippets.snippets.<key>.tags.[]": {},
   "code_snippets.snippets.<key>.title": {},
   "http_allowed_hosts.[]": {},
+  "package_cache_dir": {},
   "preinstall_packages.[]": {},
   "runtime_package_installation": {},
-  "skip_host_header_verification": {}
+  "skip_host_header_verification": {},
+  "workers.max_workers": {},
+  "workers.prewarmed_workers": {},
+  "workers.queue_capacity": {}
 }

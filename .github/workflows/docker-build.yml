@@ -115,6 +115,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: "Install Pyodide assets"
+        run: npm ci --ignore-scripts
+
       - name: "Install Rust toolchain"
         run: cargo --help
 

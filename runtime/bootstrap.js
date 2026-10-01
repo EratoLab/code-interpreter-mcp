@@ -2,7 +2,13 @@
 
 {
   const core = globalThis.Deno.core;
-  const { op_fetch_content_type, op_fetch_url, op_random_fill, op_package_log } = core.ops;
+  const {
+    op_fetch_content_type,
+    op_fetch_url,
+    op_package_layer_file,
+    op_random_fill,
+    op_package_log,
+  } = core.ops;
   const { URL, URLSearchParams } = core.loadExtScript("ext:deno_web/00_url.js");
   const { TextDecoder, TextEncoder } = core.loadExtScript(
     "ext:deno_web/08_text_encoding.js",
@@ -224,6 +230,7 @@
   globalThis.window = globalThis;
   globalThis.self = globalThis;
   globalThis.__packageLog = op_package_log;
+  globalThis.__readPackageLayerFile = op_package_layer_file;
   globalThis.__createSafeGlobals = createSafeGlobals;
   globalThis.__resetCapture = resetCapture;
   globalThis.__captureLine = captureLine;
@@ -238,7 +245,7 @@
     return WebAssembly.instantiate(await resolved.arrayBuffer(), imports);
   };
 
-  // Retain only the two capability-checked op closures above. Removing Deno
+  // Retain only the capability-checked op closures above. Removing Deno
   // prevents Python/JavaScript from discovering arbitrary host operations.
   try {
     delete globalThis.Deno;

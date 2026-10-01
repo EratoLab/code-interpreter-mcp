@@ -1,9 +1,9 @@
-(async () => {
+globalThis.__pyodideInitialization = (async () => {
   const safeGlobals = globalThis.__createSafeGlobals();
   const pyodide = await globalThis.loadPyodide({
     indexURL: "https://pyodide.local/",
     lockFileURL: "https://pyodide.local/pyodide-lock.json",
-    packageBaseUrl: "https://cdn.jsdelivr.net/pyodide/v314.0.2/full/",
+    packageBaseUrl: "https://pyodide.local/",
     createPyodideModule: globalThis.createPyodideModule,
     jsglobals: safeGlobals,
     stdout: (line) => globalThis.__captureLine("stdout", line),
@@ -23,15 +23,36 @@
       throw new Error(`micropip did not load: ${JSON.stringify(globalThis.__capture)}`);
     }
 
-    const micropip = pyodide.pyimport("micropip");
-    try {
-      // Resolve the complete list together so version constraints are respected.
-      log(`installing configured packages and dependencies: ${JSON.stringify(packages)}`);
-      await micropip.install(packages);
-      const installed = pyodide.runPython("str(__import__('micropip').list())");
-      log(`preinstallation complete: ${JSON.stringify(packages)}; installed packages: ${installed}`);
-    } finally {
-      micropip.destroy();
+    if (policy.package_layer) {
+      const layer = policy.package_layer;
+      const purelib = pyodide.runPython(
+        "import sysconfig; sysconfig.get_path('purelib')",
+      );
+      if (purelib !== layer.purelib) {
+        throw new Error(`Package cache Python path mismatch: ${purelib} != ${layer.purelib}`);
+      }
+      const pyodidePackages = layer.pyodide_packages.filter(
+        (name) => name !== "micropip",
+      );
+      if (pyodidePackages.length > 0) {
+        await pyodide.loadPackage(pyodidePackages, {
+          messageCallback: (message) => log(message),
+          errorCallback: (message) => log(`ERROR: ${message}`),
+        });
+      }
+      await restorePackageFiles(pyodide.FS, purelib, layer.files);
+      log(`copied ${layer.files.length} cached package files into the sandbox`);
+    } else {
+      const micropip = pyodide.pyimport("micropip");
+      try {
+        // Resolve the complete list together so version constraints are respected.
+        log(`installing configured packages and dependencies: ${JSON.stringify(packages)}`);
+        await micropip.install(packages);
+        const installed = pyodide.runPython("str(__import__('micropip').list())");
+        log(`preinstallation complete: ${JSON.stringify(packages)}; installed packages: ${installed}`);
+      } finally {
+        micropip.destroy();
+      }
     }
 
     if (!policy.runtime_package_installation) {
@@ -89,4 +110,65 @@ del _micropip, _pathlib, _shutil, _sys, _micropip_dir, _name
   globalThis.__pyodide = pyodide;
   globalThis.createPyodideModule = undefined;
   globalThis.__resetCapture();
-})()
+  if (policy.build_package_layer) {
+    return JSON.stringify(await exportPackageLayer(pyodide, packages, policy.pyodide_version));
+  }
+})();
+
+async function restorePackageFiles(FS, purelib, files) {
+  for (const relativePath of files) {
+    const target = `${purelib}/${relativePath}`;
+    const parent = target.slice(0, target.lastIndexOf("/"));
+    FS.mkdirTree(parent);
+    const bytes = await globalThis.__readPackageLayerFile(relativePath);
+    FS.writeFile(target, bytes);
+  }
+}
+
+function encodeBase64(bytes) {
+  const chunkSize = 32 * 1024;
+  let binary = "";
+  for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function exportPackageLayer(pyodide, preinstallPackages, pyodideVersion) {
+  const purelib = pyodide.runPython("import sysconfig; sysconfig.get_path('purelib')");
+  const files = [];
+  const directories = [purelib];
+  while (directories.length > 0) {
+    const directory = directories.pop();
+    for (const name of pyodide.FS.readdir(directory)) {
+      if (name === "." || name === "..") continue;
+      const path = `${directory}/${name}`;
+      const stat = pyodide.FS.lstat(path);
+      if (pyodide.FS.isDir(stat.mode)) {
+        directories.push(path);
+      } else if (pyodide.FS.isFile(stat.mode)) {
+        const relative = path.slice(`${purelib}/`.length);
+        if (
+          relative === "micropip" ||
+          relative.startsWith("micropip/") ||
+          /^micropip-[^/]+\.dist-info\//.test(relative)
+        ) {
+          continue;
+        }
+        files.push({
+          path: relative,
+          content_base64: encodeBase64(pyodide.FS.readFile(path)),
+        });
+      }
+    }
+  }
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  return {
+    schema: 1,
+    pyodide_version: pyodideVersion,
+    preinstall_packages: preinstallPackages,
+    purelib,
+    pyodide_packages: Object.keys(pyodide.loadedPackages).sort(),
+    files,
+  };
+}
