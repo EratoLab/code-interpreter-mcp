@@ -184,33 +184,50 @@ jobs:
           set -euo pipefail
 
           container_name="code-interpreter-mcp-smoke-${GITHUB_RUN_ID}"
+          smoke_config="$RUNNER_TEMP/code-interpreter-mcp-smoke.auto.code-interpreter-mcp.toml"
+          response_headers="$RUNNER_TEMP/code-interpreter-mcp-smoke.headers"
+          cat > "$smoke_config" <<'EOF'
+          preinstall_packages = ["snowballstemmer==3.0.1"]
+          EOF
           cleanup() {
             docker rm -f "$container_name" >/dev/null 2>&1 || true
+            rm -f "$smoke_config" "$response_headers"
           }
           show_logs() {
             docker logs "$container_name" || true
+          }
+          response_payload() {
+            local payload
+            payload="$(printf '%s\n' "$1" | sed -n 's/^data: //p' | tail -n 1)"
+            if [[ -z "$payload" ]]; then
+              payload="$1"
+            fi
+            printf '%s' "$payload"
           }
           trap cleanup EXIT
 
           docker pull "$IMAGE"
           docker run --detach --name "$container_name" \
             -p 127.0.0.1:18000:8000 \
+            --volume "$smoke_config:/app/ci.auto.code-interpreter-mcp.toml:ro" \
             "$IMAGE"
 
           request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci-smoke-test","version":"1.0.0"}}}'
+          initialized=false
           for attempt in $(seq 1 60); do
             if response="$(curl --silent --show-error --fail --max-time 5 \
+              --dump-header "$response_headers" \
               -H 'Content-Type: application/json' \
               -H 'Accept: application/json, text/event-stream' \
               --data "$request" \
               http://127.0.0.1:18000/mcp 2>/dev/null)"; then
-              payload="$(printf '%s\n' "$response" | sed -n 's/^data: //p' | tail -n 1)"
-              if [[ -z "$payload" ]]; then
-                payload="$response"
-              fi
+              payload="$(response_payload "$response")"
               if printf '%s' "$payload" | jq -e '.result.protocolVersion == "2025-11-25" and .result.serverInfo.name == "code-interpreter-mcp"' >/dev/null; then
-                echo "MCP initialize succeeded for $IMAGE"
-                exit 0
+                session_id="$(awk 'tolower($1) == "mcp-session-id:" { gsub(sprintf("%c", 13), "", $2); print $2; exit }' "$response_headers")"
+                if [[ -n "$session_id" ]]; then
+                  initialized=true
+                  break
+                fi
               fi
             fi
 
@@ -222,9 +239,43 @@ jobs:
             sleep 5
           done
 
-          echo "Timed out waiting for MCP initialize response"
-          show_logs
-          exit 1
+          if [[ "$initialized" != "true" ]]; then
+            echo "Timed out waiting for MCP initialize response with a session ID"
+            show_logs
+            exit 1
+          fi
+
+          initialized_notification='{"jsonrpc":"2.0","method":"notifications/initialized"}'
+          curl --silent --show-error --fail --max-time 10 --output /dev/null \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H "Mcp-Session-Id: $session_id" \
+            -H 'MCP-Protocol-Version: 2025-11-25' \
+            --data "$initialized_notification" \
+            http://127.0.0.1:18000/mcp
+
+          tool_request='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"run_python_code","arguments":{"code":"40 + 2"}}}'
+          if ! tool_response="$(curl --silent --show-error --fail --max-time 60 \
+            --dump-header "$response_headers" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H "Mcp-Session-Id: $session_id" \
+            -H 'MCP-Protocol-Version: 2025-11-25' \
+            --data "$tool_request" \
+            http://127.0.0.1:18000/mcp)"; then
+            echo "MCP run_python_code request failed"
+            show_logs
+            exit 1
+          fi
+
+          tool_payload="$(response_payload "$tool_response")"
+          if ! printf '%s' "$tool_payload" | jq -e '.result.structuredContent.success == true and .result.structuredContent.result == "42" and .result.structuredContent.error == null' >/dev/null; then
+            echo "MCP run_python_code returned an unexpected result: $tool_payload"
+            show_logs
+            exit 1
+          fi
+
+          echo "MCP initialize and run_python_code succeeded for $IMAGE"
 
   build-and-push-arm64:
     if: github.event_name == 'push'
