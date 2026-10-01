@@ -124,13 +124,15 @@ runtime_package_installation = false
 ```
 
 `preinstall_packages` defaults to `[]`. It accepts micropip-compatible package
-requirements (including version constraints and compatible wheel URLs). Packages
-and their required dependencies are installed before user code in **every fresh
-sandbox**. Artifacts are cached in server memory, but installed Python state is
-never shared between calls. Preinstallation counts toward the request timeout.
-Progress, package names, completion, and diagnostic failures are logged to server
-stderr. Installation failures return a runtime initialization error without
-executing user code. Later config files replace the entire package list.
+requirements (including version constraints and compatible wheel URLs). On
+server startup, packages and their dependencies are installed into a durable
+local package layer when the layer is missing or no longer matches the configured
+requirements. Each fresh sandbox copies package files from that layer; Python
+interpreter state is never shared between calls. Initial preparation happens
+before the server accepts requests and is outside `timeout_ms`. Progress,
+package names, completion, and diagnostic failures are logged to server stderr.
+Preparation failures prevent the server from starting. Later config files
+replace the entire package list.
 
 `runtime_package_installation` defaults to `true`. When enabled, recognized
 imports and explicit `micropip.install` calls retain their normal behavior. When
@@ -195,6 +197,44 @@ repository.
 
 ## Configuration and limits
 
+### Queue and workers
+
+Code execution is handled by a shared FIFO queue and worker pool. Defaults are
+two workers, eight queued requests, and one prewarmed worker. When the queue is
+full, the tool returns a structured overload error. MCP clients that provide a
+progress token receive a queue position after one second of waiting, then every
+five seconds while the request remains queued. Queue wait does not consume
+`timeout_ms`.
+
+```toml
+package_cache_dir = ".code-interpreter-mcp-package-cache"
+
+[workers]
+max_workers = 2
+queue_capacity = 8
+prewarmed_workers = 1
+```
+
+Prewarmed workers initialize V8, Pyodide, and configured preinstalled packages
+before accepting work. Each execution still gets a fresh isolate. The worker
+discards that isolate after the call and prepares a clean replacement.
+
+The server prepares a durable local package layer at startup when
+`preinstall_packages` is non-empty. It reuses the layer when its Pyodide version
+and package list match; otherwise it installs the configured packages and
+rebuilds the layer. New isolates copy package files from this local layer.
+Package files included with the pinned Pyodide distribution are also served
+locally, so loading those packages does not require the CDN. Runtime installs
+requested by user code still follow `runtime_package_installation` and the
+configured HTTPS host allowlist.
+
+The cache directory defaults to `.code-interpreter-mcp-package-cache` in the
+working directory. Set `package_cache_dir` or
+`CODE_INTERPRETER_MCP_PACKAGE_CACHE_DIR` to place it elsewhere. Worker settings
+can be overridden with `CODE_INTERPRETER_MCP_MAX_WORKERS`,
+`CODE_INTERPRETER_MCP_QUEUE_CAPACITY`, and
+`CODE_INTERPRETER_MCP_PREWARMED_WORKERS`.
+
 The server reads `code-interpreter-mcp.toml` and every
 `*.auto.code-interpreter-mcp.toml` file in its current working directory.
 Matching files are loaded in filename order. Values in later files override
@@ -220,6 +260,10 @@ from configuration files:
   `cdn.jsdelivr.net,pypi.org,files.pythonhosted.org`. Subdomains are accepted.
 - `CODE_INTERPRETER_MCP_ASSET_DIR`: overrides the local Pyodide asset directory. It must
   contain the files installed by the pinned `pyodide` npm package.
+- `CODE_INTERPRETER_MCP_PACKAGE_CACHE_DIR`: overrides the durable local package layer directory.
+- `CODE_INTERPRETER_MCP_MAX_WORKERS`: maximum simultaneous execution workers (default `2`).
+- `CODE_INTERPRETER_MCP_QUEUE_CAPACITY`: maximum number of waiting requests (default `8`).
+- `CODE_INTERPRETER_MCP_PREWARMED_WORKERS`: worker isolates initialized before the server accepts requests (default `1`, maximum `workers.max_workers`).
 - `CODE_INTERPRETER_MCP_HTTP_ALLOWED_HOSTS`: comma-separated inbound HTTP Host
   allowlist, overriding `http_allowed_hosts`. Whitespace and empty entries are ignored.
 - `CODE_INTERPRETER_MCP_SKIP_HOST_HEADER_VERIFICATION`: `true` or `false`, overriding
@@ -267,6 +311,9 @@ If a returned-file limit is exceeded, whole files outside the limit are
 omitted and `output_truncated` is set to `true`.
 
 Downloaded package artifacts are cached in memory for the life of the server.
+Configured preinstalled packages are also captured in a durable local package
+layer at server startup and copied into fresh isolates. The package layer is
+recreated when the Pyodide version or configured package list changes.
 
 ## Security scope
 

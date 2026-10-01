@@ -4,6 +4,11 @@ use std::{
     io::{self, Write},
     net::SocketAddr,
     path::{Component, Path},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -13,8 +18,10 @@ use rmcp::{
     Json, ServerHandler,
     handler::server::tool::ToolRouter,
     handler::server::wrapper::Parameters,
-    model::ProtocolVersion,
-    schemars, tool, tool_handler, tool_router,
+    model::{ProgressNotificationParam, ProtocolVersion},
+    schemars,
+    service::{RequestContext, RoleServer},
+    tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
@@ -90,6 +97,15 @@ impl RunPythonCodeOutput {
         )
     }
 
+    fn overloaded() -> Self {
+        Self::failure(
+            "overloaded",
+            "The code execution queue is full; retry after a worker becomes available",
+            None,
+            false,
+        )
+    }
+
     fn failure(
         kind: impl Into<String>,
         message: impl Into<String>,
@@ -159,7 +175,7 @@ struct CodeInterpreterMcpServer {
 
 #[tool_router(router = tool_router)]
 impl CodeInterpreterMcpServer {
-    fn new(config: &AppConfig) -> Self {
+    async fn new(config: &AppConfig) -> Result<Self> {
         let code_snippets = CodeSnippetsConfig {
             enabled: config.code_snippets.enabled,
             snippets: config
@@ -178,19 +194,20 @@ impl CodeInterpreterMcpServer {
             tool_router.disable_route("list_code_snippets");
             tool_router.disable_route("get_code_snippet");
         }
-        Self {
-            runtime: PyodideRuntime::new(config),
+        Ok(Self {
+            runtime: PyodideRuntime::new(config).await?,
             code_snippets,
             tool_router,
-        }
+        })
     }
 
     #[tool(
-        description = "Run Python code in a fresh Pyodide WebAssembly environment. Supports top-level await, pandas and other Pyodide packages, micropip.install() for compatible Python wheels, and Base64-encoded input files mounted below /workspace. Returns captured stdout, stderr, the final expression, Base64-encoded files created by the script, and a structured error when execution fails."
+        description = "Run Python code in a fresh Pyodide WebAssembly environment using a bounded worker queue. Queued calls may send MCP progress updates when the client supplies a progress token. Supports top-level await, pandas and other Pyodide packages, micropip.install() for compatible Python wheels, and Base64-encoded input files mounted below /workspace. Returns captured stdout, stderr, the final expression, Base64-encoded files created by the script, and a structured error when execution fails."
     )]
     async fn run_python_code(
         &self,
         Parameters(request): Parameters<RunPythonCodeRequest>,
+        context: RequestContext<RoleServer>,
     ) -> Json<RunPythonCodeOutput> {
         let request = match validate_request(request) {
             Ok(request) => request,
@@ -199,7 +216,46 @@ impl CodeInterpreterMcpServer {
             }
         };
 
-        Json(self.runtime.execute(request).await)
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (job_id, mut response) = match self.runtime.submit(request, cancellation.clone()) {
+            Ok(submitted) => submitted,
+            Err(_) => return Json(RunPythonCodeOutput::overloaded()),
+        };
+
+        let mut progress_token = context.meta.get_progress_token();
+        let peer = context.peer;
+        let request_cancellation = context.ct;
+        let mut progress_ticks = 0u64;
+        let progress_start = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut progress_interval =
+            tokio::time::interval_at(progress_start, Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                result = &mut response => {
+                    return Json(result.unwrap_or_else(|_| RunPythonCodeOutput::runtime("Worker ended before returning a result")));
+                }
+                _ = request_cancellation.cancelled() => {
+                    cancellation.store(true, Ordering::Release);
+                    self.runtime.cancel_queued(job_id);
+                    return Json(RunPythonCodeOutput::runtime("Request cancelled while waiting for a worker"));
+                }
+                _ = progress_interval.tick(), if progress_token.is_some() => {
+                    let Some(position) = self.runtime.queue_position(job_id) else {
+                        progress_token = None;
+                        continue;
+                    };
+                    progress_ticks += 1;
+                    let notification = ProgressNotificationParam::new(
+                        progress_token.clone().expect("guarded by progress token option"),
+                        progress_ticks as f64,
+                    )
+                    .with_message(format!("Waiting for worker slot. Position {position} in the queue."));
+                    if let Err(error) = peer.notify_progress(notification).await {
+                        eprintln!("Could not send MCP queue progress notification: {error}");
+                    }
+                }
+            }
+        }
     }
 
     #[tool(
@@ -438,7 +494,7 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("invalid bind_addr: {}", config.bind_addr))?;
 
-    let server = CodeInterpreterMcpServer::new(&config);
+    let server = CodeInterpreterMcpServer::new(&config).await?;
     let http_service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
@@ -501,8 +557,11 @@ mod tests {
                 vec![("unlisted.example.com:1234", true)],
             ),
         ] {
-            let config: AppConfig = toml::from_str(settings).unwrap();
-            let server = CodeInterpreterMcpServer::new(&config);
+            let mut config: AppConfig = toml::from_str(settings).unwrap();
+            config.workers.max_workers = 1;
+            config.workers.queue_capacity = 1;
+            config.workers.prewarmed_workers = 0;
+            let server = CodeInterpreterMcpServer::new(&config).await.unwrap();
             let service = StreamableHttpService::new(
                 move || Ok(server.clone()),
                 LocalSessionManager::default().into(),

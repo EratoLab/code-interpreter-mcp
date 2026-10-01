@@ -9,6 +9,9 @@ use facet::Facet;
 use serde::Deserialize;
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8000";
+const DEFAULT_MAX_WORKERS: usize = 2;
+const DEFAULT_QUEUE_CAPACITY: usize = 8;
+const DEFAULT_PREWARMED_WORKERS: usize = 1;
 
 #[derive(Debug, Clone, Deserialize, Facet)]
 pub struct AppConfig {
@@ -25,7 +28,21 @@ pub struct AppConfig {
     #[serde(default = "default_runtime_package_installation")]
     pub runtime_package_installation: bool,
     #[serde(default)]
+    pub workers: WorkersConfig,
+    pub package_cache_dir: Option<PathBuf>,
+    #[serde(default)]
     pub code_snippets: CodeSnippetsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Facet)]
+#[serde(default)]
+pub struct WorkersConfig {
+    #[serde(default = "default_max_workers")]
+    pub max_workers: usize,
+    #[serde(default = "default_queue_capacity")]
+    pub queue_capacity: usize,
+    #[serde(default = "default_prewarmed_workers")]
+    pub prewarmed_workers: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Facet)]
@@ -59,6 +76,18 @@ fn default_runtime_package_installation() -> bool {
     true
 }
 
+fn default_max_workers() -> usize {
+    DEFAULT_MAX_WORKERS
+}
+
+fn default_queue_capacity() -> usize {
+    DEFAULT_QUEUE_CAPACITY
+}
+
+fn default_prewarmed_workers() -> usize {
+    DEFAULT_PREWARMED_WORKERS
+}
+
 fn default_bind_address() -> String {
     DEFAULT_BIND_ADDRESS.to_owned()
 }
@@ -81,6 +110,24 @@ impl AppConfig {
         if let Some(value) = env::var_os("CODE_INTERPRETER_MCP_ASSET_DIR") {
             config.asset_dir = Some(PathBuf::from(value));
         }
+        if let Some(value) = env::var_os("CODE_INTERPRETER_MCP_PACKAGE_CACHE_DIR") {
+            config.package_cache_dir = Some(PathBuf::from(value));
+        }
+        if let Ok(value) = env::var("CODE_INTERPRETER_MCP_MAX_WORKERS") {
+            config.workers.max_workers = value
+                .parse()
+                .context("CODE_INTERPRETER_MCP_MAX_WORKERS must be a positive integer")?;
+        }
+        if let Ok(value) = env::var("CODE_INTERPRETER_MCP_QUEUE_CAPACITY") {
+            config.workers.queue_capacity = value
+                .parse()
+                .context("CODE_INTERPRETER_MCP_QUEUE_CAPACITY must be a positive integer")?;
+        }
+        if let Ok(value) = env::var("CODE_INTERPRETER_MCP_PREWARMED_WORKERS") {
+            config.workers.prewarmed_workers = value
+                .parse()
+                .context("CODE_INTERPRETER_MCP_PREWARMED_WORKERS must be a non-negative integer")?;
+        }
         if let Ok(value) = env::var("CODE_INTERPRETER_MCP_HTTP_ALLOWED_HOSTS") {
             config.http_allowed_hosts = value
                 .split(',')
@@ -97,6 +144,25 @@ impl AppConfig {
         Ok(config)
     }
 
+    pub fn package_cache_dir(&self) -> PathBuf {
+        self.package_cache_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(".code-interpreter-mcp-package-cache"))
+    }
+
+    pub fn validate_worker_settings(&self) -> Result<()> {
+        if self.workers.max_workers == 0 {
+            bail!("max_workers must be greater than zero");
+        }
+        if self.workers.queue_capacity == 0 {
+            bail!("queue_capacity must be greater than zero");
+        }
+        if self.workers.prewarmed_workers > self.workers.max_workers {
+            bail!("prewarmed_workers must not exceed max_workers");
+        }
+        Ok(())
+    }
+
     fn from_files(paths: &[PathBuf]) -> Result<Self> {
         let mut merged = toml::Value::Table(Default::default());
         for path in paths {
@@ -109,6 +175,16 @@ impl AppConfig {
         merged
             .try_into()
             .context("invalid code-interpreter-mcp configuration")
+    }
+}
+
+impl Default for WorkersConfig {
+    fn default() -> Self {
+        Self {
+            max_workers: default_max_workers(),
+            queue_capacity: default_queue_capacity(),
+            prewarmed_workers: default_prewarmed_workers(),
+        }
     }
 }
 
