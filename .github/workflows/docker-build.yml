@@ -10,6 +10,7 @@ on:
       - 'src/**'
       - 'generated/**'
       - 'runtime/**'
+      - 'scripts/**'
       - 'Dockerfile'
       - '.dockerignore'
       - 'Cargo.toml'
@@ -23,6 +24,7 @@ on:
       - 'src/**'
       - 'generated/**'
       - 'runtime/**'
+      - 'scripts/**'
       - 'Dockerfile'
       - '.dockerignore'
       - 'Cargo.toml'
@@ -174,6 +176,55 @@ jobs:
             ${{ env.CACHE_SOURCE != '' && format('type=registry,image-manifest=true,ref={0}/{1}:{2}-amd64-buildcache', env.REGISTRY, env.IMAGE_NAME, env.CACHE_SOURCE) || '' }}
             ${{ env.CACHE_TARGET != 'main' && format('type=registry,image-manifest=true,ref={0}/{1}:main-amd64-buildcache', env.REGISTRY, env.IMAGE_NAME) || '' }}
           cache-to: type=registry,image-manifest=true,mode=max,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.CACHE_DESTINATION }}-amd64-buildcache
+
+      - name: Smoke test published amd64 image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.SHA_TAG }}-amd64
+        run: |
+          set -euo pipefail
+
+          container_name="code-interpreter-mcp-smoke-${GITHUB_RUN_ID}"
+          cleanup() {
+            docker rm -f "$container_name" >/dev/null 2>&1 || true
+          }
+          show_logs() {
+            docker logs "$container_name" || true
+          }
+          trap cleanup EXIT
+
+          docker pull "$IMAGE"
+          docker run --detach --name "$container_name" \
+            -p 127.0.0.1:18000:8000 \
+            "$IMAGE"
+
+          request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci-smoke-test","version":"1.0.0"}}}'
+          for attempt in $(seq 1 60); do
+            if response="$(curl --silent --show-error --fail --max-time 5 \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              --data "$request" \
+              http://127.0.0.1:18000/mcp 2>/dev/null)"; then
+              payload="$(printf '%s\n' "$response" | sed -n 's/^data: //p' | tail -n 1)"
+              if [[ -z "$payload" ]]; then
+                payload="$response"
+              fi
+              if printf '%s' "$payload" | jq -e '.result.protocolVersion == "2025-11-25" and .result.serverInfo.name == "code-interpreter-mcp"' >/dev/null; then
+                echo "MCP initialize succeeded for $IMAGE"
+                exit 0
+              fi
+            fi
+
+            if [[ "$(docker inspect --format '{{.State.Running}}' "$container_name")" != "true" ]]; then
+              echo "Container exited before MCP initialize succeeded"
+              show_logs
+              exit 1
+            fi
+            sleep 5
+          done
+
+          echo "Timed out waiting for MCP initialize response"
+          show_logs
+          exit 1
 
   build-and-push-arm64:
     if: github.event_name == 'push'

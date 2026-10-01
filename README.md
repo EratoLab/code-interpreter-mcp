@@ -223,10 +223,12 @@ The server prepares a durable local package layer at startup when
 `preinstall_packages` is non-empty. It reuses the layer when its Pyodide version
 and package list match; otherwise it installs the configured packages and
 rebuilds the layer. New isolates copy package files from this local layer.
-Package files included with the pinned Pyodide distribution are also served
-locally, so loading those packages does not require the CDN. Runtime installs
-requested by user code still follow `runtime_package_installation` and the
-configured HTTPS host allowlist.
+The pinned Pyodide runtime files are served locally. Wheel files are not
+included in the npm package, so the Docker build downloads and verifies the
+micropip wheel against `pyodide-lock.json`. Other missing Pyodide package wheels
+are fetched from the matching versioned jsDelivr distribution and must be
+permitted by `allowed_hosts`. Runtime installs requested by user code still
+follow `runtime_package_installation` and the configured HTTPS host allowlist.
 
 The cache directory defaults to `.code-interpreter-mcp-package-cache` in the
 working directory. Set `package_cache_dir` or

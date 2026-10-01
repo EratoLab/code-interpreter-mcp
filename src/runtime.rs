@@ -30,6 +30,7 @@ include!(concat!(env!("OUT_DIR"), "/extension_sources.rs"));
 
 const PYODIDE_ORIGIN: &str = "pyodide.local";
 const PYODIDE_VERSION: &str = "314.0.2";
+const PYODIDE_PACKAGE_CDN: &str = "cdn.jsdelivr.net";
 const PACKAGE_CACHE_SCHEMA: u32 = 1;
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 
@@ -753,14 +754,34 @@ async fn fetch_url(config: &RuntimeConfig, raw_url: &str) -> Result<Arc<Vec<u8>>
         let root = tokio::fs::canonicalize(config.asset_dir.as_ref())
             .await
             .context("could not resolve local Pyodide asset directory")?;
-        let resolved_asset = tokio::fs::canonicalize(&asset_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "could not resolve local Pyodide asset {}",
+        let resolved_asset = match tokio::fs::canonicalize(&asset_path).await {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The npm Pyodide package contains the runtime, but not the
+                // wheel files referenced by pyodide-lock.json. Fetch those
+                // from the matching, versioned Pyodide CDN distribution.
+                let cdn_url = format!(
+                    "https://{PYODIDE_PACKAGE_CDN}/pyodide/v{PYODIDE_VERSION}/full/{}",
                     relative.display()
-                )
-            })?;
+                );
+                return Box::pin(fetch_url(config, &cdn_url))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "local Pyodide asset {} is missing and its CDN fallback failed",
+                            relative.display()
+                        )
+                    });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "could not resolve local Pyodide asset {}",
+                        relative.display()
+                    )
+                });
+            }
+        };
         if !resolved_asset.starts_with(&root) || !resolved_asset.is_file() {
             bail!(
                 "local Pyodide asset is not available: {}",

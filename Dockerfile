@@ -13,6 +13,8 @@ FROM node:22-bookworm-slim AS pyodide-assets
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts --omit=dev
+COPY scripts/fetch-pyodide-wheel.mjs ./
+RUN node ./fetch-pyodide-wheel.mjs /app/node_modules/pyodide
 
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
