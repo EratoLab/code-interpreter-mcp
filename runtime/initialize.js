@@ -32,7 +32,8 @@ globalThis.__pyodideInitialization = (async () => {
         throw new Error(`Package cache Python path mismatch: ${purelib} != ${layer.purelib}`);
       }
       const pyodidePackages = layer.pyodide_packages.filter(
-        (name) => name !== "micropip",
+        (name) =>
+          name !== "micropip" && Object.hasOwn(pyodide.lockfile.packages, name),
       );
       if (pyodidePackages.length > 0) {
         await pyodide.loadPackage(pyodidePackages, {
@@ -168,7 +169,11 @@ async function exportPackageLayer(pyodide, preinstallPackages, pyodideVersion) {
     pyodide_version: pyodideVersion,
     preinstall_packages: preinstallPackages,
     purelib,
-    pyodide_packages: Object.keys(pyodide.loadedPackages).sort(),
+    // micropip also records PyPI-installed names in loadedPackages. Only
+    // Pyodide lockfile packages can be passed back to pyodide.loadPackage.
+    pyodide_packages: Object.keys(pyodide.loadedPackages)
+      .filter((name) => Object.hasOwn(pyodide.lockfile.packages, name))
+      .sort(),
     files,
   };
 }
