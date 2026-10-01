@@ -5,7 +5,7 @@
   const {
     op_fetch_content_type,
     op_fetch_url,
-    op_package_layer_file,
+    op_read_package_layer_file,
     op_random_fill,
     op_package_log,
   } = core.ops;
@@ -230,7 +230,7 @@
   globalThis.window = globalThis;
   globalThis.self = globalThis;
   globalThis.__packageLog = op_package_log;
-  globalThis.__readPackageLayerFile = op_package_layer_file;
+  globalThis.__readPackageLayerFile = op_read_package_layer_file;
   globalThis.__createSafeGlobals = createSafeGlobals;
   globalThis.__resetCapture = resetCapture;
   globalThis.__captureLine = captureLine;
