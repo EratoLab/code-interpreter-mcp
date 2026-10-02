@@ -38,6 +38,43 @@ const MAX_CODE_BYTES: usize = 1024 * 1024;
 const MAX_FILES: usize = 64;
 const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOTAL_FILE_BYTES: usize = 50 * 1024 * 1024;
+const RUN_PYTHON_CODE_DESCRIPTION: &str = "Run Python code in a fresh Pyodide WebAssembly environment using a bounded worker queue. Queued calls may send MCP progress updates when the client supplies a progress token. Supports top-level await and Base64-encoded input files mounted below /workspace. Returns captured stdout, stderr, the final expression, Base64-encoded files created by the script, and a structured error when execution fails.";
+
+fn run_python_code_description(config: &AppConfig) -> String {
+    let mut description = RUN_PYTHON_CODE_DESCRIPTION.to_owned();
+    if config.runtime_package_installation {
+        description.push_str(" Supports micropip.install() for compatible Python wheels.");
+    }
+    let packages: Vec<_> = config
+        .preinstall_packages
+        .iter()
+        .filter_map(|requirement| package_name(requirement))
+        .collect();
+    if !packages.is_empty() {
+        description.push_str(" Pre-installed libraries: ");
+        description.push_str(&packages.join(", "));
+        description.push('.');
+    }
+    description
+}
+
+fn package_name(requirement: &str) -> Option<String> {
+    let requirement = requirement.trim();
+    if let Ok(url) = reqwest::Url::parse(requirement) {
+        // Wheel filenames start with the distribution name, followed by the
+        // version and compatibility tags. Query strings and fragments are not
+        // part of the filename.
+        let filename = url.path().rsplit('/').next()?;
+        let (name, _) = filename.strip_suffix(".whl")?.split_once('-')?;
+        return (!name.is_empty()).then(|| name.to_owned());
+    }
+    // Named requirements start with the distribution name, before any extras,
+    // version constraints, environment markers, or direct-reference URL.
+    let name = requirement
+        .split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-'))
+        .next()?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RunPythonCodeRequest {
@@ -189,21 +226,29 @@ impl CodeInterpreterMcpServer {
             include_snippet_tags: Vec::new(),
             exclude_snippet_ids: Vec::new(),
         };
+        Ok(Self {
+            runtime: PyodideRuntime::new(config).await?,
+            code_snippets,
+            tool_router: Self::configured_tool_router(config),
+        })
+    }
+
+    fn configured_tool_router(config: &AppConfig) -> ToolRouter<Self> {
         let mut tool_router = Self::tool_router();
+        tool_router
+            .map
+            .get_mut("run_python_code")
+            .expect("run_python_code route is registered")
+            .attr
+            .description = Some(run_python_code_description(config).into());
         if !config.code_snippets.enabled {
             tool_router.disable_route("list_code_snippets");
             tool_router.disable_route("get_code_snippet");
         }
-        Ok(Self {
-            runtime: PyodideRuntime::new(config).await?,
-            code_snippets,
-            tool_router,
-        })
+        tool_router
     }
 
-    #[tool(
-        description = "Run Python code in a fresh Pyodide WebAssembly environment using a bounded worker queue. Queued calls may send MCP progress updates when the client supplies a progress token. Supports top-level await, pandas and other Pyodide packages, micropip.install() for compatible Python wheels, and Base64-encoded input files mounted below /workspace. Returns captured stdout, stderr, the final expression, Base64-encoded files created by the script, and a structured error when execution fails."
-    )]
+    #[tool(description = RUN_PYTHON_CODE_DESCRIPTION)]
     async fn run_python_code(
         &self,
         Parameters(request): Parameters<RunPythonCodeRequest>,
@@ -525,6 +570,86 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn advertised_description_reflects_configuration() {
+        for installation_enabled in [false, true] {
+            for packages in [
+                vec![],
+                vec![
+                    "numpy>=2,<3",
+                    "snowballstemmer==3.0.1",
+                    "pandas[performance]",
+                ],
+            ] {
+                let mut config: AppConfig = toml::from_str("").unwrap();
+                config.runtime_package_installation = installation_enabled;
+                config.preinstall_packages = packages.iter().map(|s| (*s).to_owned()).collect();
+                // tools/list uses this router's list_all(), including its
+                // configured metadata rather than the static tool annotation.
+                let tool = CodeInterpreterMcpServer::configured_tool_router(&config)
+                    .list_all()
+                    .into_iter()
+                    .find(|tool| tool.name == "run_python_code")
+                    .unwrap();
+                let description = tool.description.unwrap();
+                assert!(description.contains("Pyodide WebAssembly"));
+                assert_eq!(
+                    description.contains("micropip.install()"),
+                    installation_enabled
+                );
+                if packages.is_empty() {
+                    assert!(!description.contains("Pre-installed libraries:"));
+                    assert!(!description.contains("pandas"));
+                    assert!(!description.contains("other Pyodide packages"));
+                } else {
+                    assert!(
+                        description
+                            .ends_with("Pre-installed libraries: numpy, snowballstemmer, pandas.")
+                    );
+                    assert!(!description.contains("3.0.1"));
+                    assert!(!description.contains(">=2"));
+                    assert!(!description.contains("performance"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extracts_names_from_package_requirements() {
+        for (requirement, expected) in [
+            ("pandas", "pandas"),
+            (" snowballstemmer==3.0.1 ", "snowballstemmer"),
+            ("numpy>=2,<3", "numpy"),
+            ("numpy~=2.0", "numpy"),
+            ("numpy!=2.0", "numpy"),
+            ("numpy===2.0", "numpy"),
+            ("numpy<=2.0", "numpy"),
+            ("numpy>1.0", "numpy"),
+            ("numpy (>=2,<3)", "numpy"),
+            ("pkg[extra,other]>=1; python_version >= '3.10'", "pkg"),
+            ("pkg; python_version >= '3.10'", "pkg"),
+            ("my-package_name.dist==1.0", "my-package_name.dist"),
+            ("pkg @ https://example.com/pkg-1.0-py3-none-any.whl", "pkg"),
+            (
+                "https://example.com/snowballstemmer-3.0.1-py3-none-any.whl",
+                "snowballstemmer",
+            ),
+            (
+                "https://example.com/my_package-1.0-1-py3-none-any.whl?token=abc#sha256=123",
+                "my_package",
+            ),
+            ("emfs:/wheels/my_package-1.0-py3-none-any.whl", "my_package"),
+        ] {
+            assert_eq!(
+                package_name(requirement).as_deref(),
+                Some(expected),
+                "{requirement}"
+            );
+        }
+        assert_eq!(package_name(""), None);
+        assert_eq!(package_name("https://example.com/not-a-wheel"), None);
+    }
 
     #[tokio::test]
     async fn enforces_configured_http_hosts() {
