@@ -32,6 +32,21 @@ pub struct AppConfig {
     pub package_cache_dir: Option<PathBuf>,
     #[serde(default)]
     pub code_snippets: CodeSnippetsConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Facet)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Minimum number of ranked snippets to return, capped by the visible catalog size.
+    pub min_hits: usize,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self { min_hits: 3 }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Facet)]
@@ -262,6 +277,31 @@ fn merge(base: &mut toml::Value, incoming: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_min_hits_defaults_and_validates() {
+        assert_eq!(AppConfig::from_files(&[]).unwrap().search.min_hits, 3);
+        assert_eq!(
+            toml::from_str::<AppConfig>("[search]")
+                .unwrap()
+                .search
+                .min_hits,
+            3
+        );
+        for min_hits in [0, 1, 3, 100] {
+            let config: AppConfig =
+                toml::from_str(&format!("[search]\nmin_hits = {min_hits}")).unwrap();
+            assert_eq!(config.search.min_hits, min_hits);
+        }
+        for value in ["-1", "1.5", "'3'", "true"] {
+            assert!(toml::from_str::<AppConfig>(&format!("[search]\nmin_hits = {value}")).is_err());
+        }
+        assert!(
+            crate::config_reference::generate_config_reference()
+                .get("search.min_hits")
+                .is_some()
+        );
+    }
 
     #[test]
     fn host_header_settings_default_and_merge_independently_of_package_hosts() {
