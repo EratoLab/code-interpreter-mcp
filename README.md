@@ -134,6 +134,11 @@ package names, completion, and diagnostic failures are logged to server stderr.
 Preparation failures prevent the server from starting. Later config files
 replace the entire package list.
 
+The `run_python_code` description returned by `tools/list` lists configured
+pre-installed libraries by package name, omitting version constraints and wheel
+URL details. It advertises `micropip.install()` only when runtime package
+installation is enabled.
+
 `runtime_package_installation` defaults to `true`. When enabled, recognized
 imports and explicit `micropip.install` calls retain their normal behavior. When
 `false`, automatic package loading is skipped; the standard library and packages
