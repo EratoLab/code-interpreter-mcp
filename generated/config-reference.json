@@ -15,6 +15,7 @@
   "package_cache_dir": {},
   "preinstall_packages.[]": {},
   "runtime_package_installation": {},
+  "search.min_hits": {},
   "skip_host_header_verification": {},
   "workers.max_workers": {},
   "workers.prewarmed_workers": {},

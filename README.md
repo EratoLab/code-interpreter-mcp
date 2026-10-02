@@ -157,10 +157,27 @@ the request or its input files.
 
 The server can expose configured Python snippets through `list_code_snippets`
 and `get_code_snippet`. Listing returns snippet IDs and descriptive metadata;
-search is case-insensitive and checks titles and descriptions. Getting a snippet
-by ID returns its full metadata and source code. Snippets are sorted by ID.
+search is case-insensitive and checks titles and descriptions. Query words are
+split on punctuation and whitespace, deduplicated, and matched as substrings.
+Results matching more query words rank first, with title matches breaking ties,
+then snippet ID for stable ordering. Words can match across fields; unmatched
+words do not disqualify a snippet. For example, `DOCX create document` can find a
+text document conversion snippet, and `XLSX risk register` can find an Excel
+workbook snippet even if its description only mentions XLSX.
+
+All matching snippets are returned. `[search] min_hits = 3` (the default) fills
+short result lists with the next best available snippets, up to the size of the
+visible catalog. This is a minimum, not a result limit. Set `min_hits = 0` to
+return only matches, including an empty list for an unrelated query. Fallback
+results can be unrelated: inspect their descriptions before using them. Include
+and exclude filters still apply before searching. An omitted, blank, or
+punctuation-only query lists all visible snippets sorted by ID.
+Getting a snippet by ID returns its full metadata and source code.
 
 ```toml
+[search]
+min_hits = 3
+
 [code_snippets]
 enabled = true
 include_snippet_ids = []

@@ -207,6 +207,7 @@ pub(crate) struct ValidatedFile {
 struct CodeInterpreterMcpServer {
     runtime: PyodideRuntime,
     code_snippets: CodeSnippetsConfig,
+    search_min_hits: usize,
     tool_router: ToolRouter<Self>,
 }
 
@@ -229,6 +230,7 @@ impl CodeInterpreterMcpServer {
         Ok(Self {
             runtime: PyodideRuntime::new(config).await?,
             code_snippets,
+            search_min_hits: config.search.min_hits,
             tool_router: Self::configured_tool_router(config),
         })
     }
@@ -304,38 +306,26 @@ impl CodeInterpreterMcpServer {
     }
 
     #[tool(
-        description = "List configured code snippets by ID, title, description, tags, and required Python packages. Search matches title and description without returning the code."
+        description = "List configured code snippets by ID, title, description, tags, and required Python packages. Search ranks partial query matches in titles and descriptions without returning the code. Depending on search.min_hits, weak or unrelated fallback results may be included; check their descriptions before use."
     )]
     fn list_code_snippets(
         &self,
         Parameters(request): Parameters<ListCodeSnippetsRequest>,
     ) -> Json<ListCodeSnippetsOutput> {
-        let search = request
-            .search
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let snippets = self
-            .code_snippets
-            .snippets
-            .iter()
-            .filter(|(_, snippet)| {
-                search.is_none_or(|query| {
-                    snippet.title.to_lowercase().contains(&query.to_lowercase())
-                        || snippet
-                            .description
-                            .to_lowercase()
-                            .contains(&query.to_lowercase())
-                })
-            })
-            .map(|(id, snippet)| CodeSnippetSummary {
-                id: id.clone(),
-                title: snippet.title.clone(),
-                description: snippet.description.clone(),
-                required_python_packages: snippet.required_python_packages.clone(),
-                tags: snippet.tags.clone(),
-            })
-            .collect();
+        let snippets = code_interpreter_mcp::snippet_search::search_snippets(
+            &self.code_snippets.snippets,
+            request.search.as_deref(),
+            self.search_min_hits,
+        )
+        .into_iter()
+        .map(|(id, snippet)| CodeSnippetSummary {
+            id: id.clone(),
+            title: snippet.title.clone(),
+            description: snippet.description.clone(),
+            required_python_packages: snippet.required_python_packages.clone(),
+            tags: snippet.tags.clone(),
+        })
+        .collect();
         Json(ListCodeSnippetsOutput { snippets })
     }
 
@@ -382,7 +372,7 @@ impl ServerHandler for CodeInterpreterMcpServer {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ListCodeSnippetsRequest {
-    /// Optional case-insensitive search over snippet titles and descriptions.
+    /// Optional case-insensitive keywords over titles and descriptions. Partial matches are ranked by relevance; not every word needs to match.
     search: Option<String>,
 }
 
@@ -570,6 +560,59 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[tokio::test]
+    async fn snippet_search_respects_visibility_and_configured_floor() {
+        let mut config: AppConfig = toml::from_str(
+            r#"
+            [workers]
+            prewarmed_workers = 0
+            [search]
+            min_hits = 100
+            [code_snippets]
+            include_snippet_tags = ["visible"]
+            exclude_snippet_ids = ["excluded"]
+            [code_snippets.snippets.allowed]
+            title = "Text document conversion"
+            description = "Converts DOCX documents"
+            tags = ["visible"]
+            code_snippet = "pass"
+            [code_snippets.snippets.excluded]
+            title = "XLSX risk register"
+            description = "Excluded even though tagged visible"
+            tags = ["visible"]
+            code_snippet = "pass"
+            [code_snippets.snippets.hidden]
+            title = "XLSX risk register"
+            description = "Not included"
+            code_snippet = "pass"
+            "#,
+        )
+        .unwrap();
+        for (min_hits, expected_count) in [(100, 1), (0, 0)] {
+            config.search.min_hits = min_hits;
+            let server = CodeInterpreterMcpServer::new(&config).await.unwrap();
+            let result = server
+                .list_code_snippets(Parameters(ListCodeSnippetsRequest {
+                    search: Some("XLSX risk register".to_owned()),
+                }))
+                .0;
+            assert_eq!(result.snippets.len(), expected_count);
+            assert!(
+                result
+                    .snippets
+                    .iter()
+                    .all(|snippet| snippet.id == "allowed")
+            );
+            let result = server
+                .list_code_snippets(Parameters(ListCodeSnippetsRequest {
+                    search: Some("DOCX create document".to_owned()),
+                }))
+                .0;
+            assert_eq!(result.snippets.len(), 1);
+            assert_eq!(result.snippets[0].id, "allowed");
+        }
+    }
 
     #[test]
     fn advertised_description_reflects_configuration() {
