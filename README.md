@@ -292,6 +292,54 @@ from configuration files:
   allowlist, overriding `http_allowed_hosts`. Whitespace and empty entries are ignored.
 - `CODE_INTERPRETER_MCP_SKIP_HOST_HEADER_VERIFICATION`: `true` or `false`, overriding
   `skip_host_header_verification` (default `false`).
+- `CODE_INTERPRETER_MCP_MAX_FILE_KB`: decoded KB allowed per input file,
+  overriding `input_limits.max_file_kb` (default `10240`, 10 MiB).
+- `CODE_INTERPRETER_MCP_MAX_TOTAL_FILE_KB`: decoded KB allowed across input
+  files in one request, overriding `input_limits.max_total_file_kb`
+  (default `51200`, 50 MiB). Both variables use 1 KB = 1,024 bytes.
+
+### Input file and HTTP payload sizes
+
+Set input limits in integer **KB**, measured after Base64 decoding. These
+settings use **1 KB = 1,024 bytes** (1,024 KB = 1 MiB). Both settings must be
+between 1 and 1,048,576 KB (1 GiB), and `max_file_kb` must not exceed
+`max_total_file_kb`. Invalid settings prevent startup. Later configuration
+files merge these settings by key; environment variables override them.
+
+```toml
+[input_limits]
+max_file_kb = 51200        # 50 MiB per decoded input file
+max_total_file_kb = 102400 # 100 MiB across all decoded input files
+```
+
+This example permits the approximately 40 MiB CSV from ERMCP-34 and permits
+multiple files when each fits the per-file limit and their combined decoded
+size fits the aggregate limit. The maximum file count remains 64.
+
+The HTTP POST body ceiling is derived automatically from the aggregate limit;
+there is no separate HTTP setting to synchronize. For aggregate decoded byte
+allowance `T = max_total_file_kb * 1024`,
+the ceiling is `4 * ceil(T / 3) + 4 * (64 - 1) + 8388608` bytes. This accounts
+for Base64 expansion, independent padding of up to 64 files, and 8 MiB of
+JSON/RPC headroom. The default 50 MiB aggregate produces a **78,293,928-byte**
+HTTP ceiling (approximately 74.67 MiB); the 100 MiB example produces a
+**148,198,996-byte** ceiling (approximately 141.33 MiB).
+
+Headroom covers JSON/RPC fields, file paths, and Python source (including up to
+6 MiB for JSON escaping of the permitted 1 MiB source). Send canonical Base64
+strings directly in JSON. Excessive whitespace, unusually large paths or
+metadata, or escaping the Base64 characters themselves consumes headroom and
+can reach the HTTP ceiling even when decoded files fit. The whole HTTP body
+remains bounded.
+
+Input validation returns `error.kind = "validation"` before queueing or code
+execution. Its message identifies either the per-file or aggregate limit,
+the relevant configuration key, and the byte allowance. HTTP bodies over the
+derived ceiling receive **HTTP 413**, with a plain-text message identifying
+the HTTP limit and its aggregate setting. HTTP rejections and effective size
+limits are logged to server stderr so operators can diagnose clients that
+report only a generic transport failure. A reverse proxy may impose its own
+body limit and must also allow the derived ceiling.
 
 ### HTTP Host header verification
 
@@ -322,8 +370,9 @@ Per request limits:
 
 - Python source: 1 MiB
 - files: 64
-- one decoded file: 10 MiB
-- all decoded files: 50 MiB
+- one decoded input file: configurable, default 10 MiB
+- all decoded input files: configurable, default 50 MiB
+- HTTP request body: derived from input allowance, default 78,293,928 bytes
 - one network response: 100 MiB
 - stdout and stderr: 512 KiB each
 - final expression: 64 KiB

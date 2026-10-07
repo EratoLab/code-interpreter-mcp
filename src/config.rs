@@ -8,6 +8,8 @@ use anyhow::{Context, Result, bail};
 use facet::Facet;
 use serde::Deserialize;
 
+use crate::input_limits::InputLimitsConfig;
+
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8000";
 const DEFAULT_MAX_WORKERS: usize = 2;
 const DEFAULT_QUEUE_CAPACITY: usize = 8;
@@ -34,6 +36,8 @@ pub struct AppConfig {
     pub code_snippets: CodeSnippetsConfig,
     #[serde(default)]
     pub search: SearchConfig,
+    #[serde(default)]
+    pub input_limits: InputLimitsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Facet)]
@@ -156,6 +160,17 @@ impl AppConfig {
                 "CODE_INTERPRETER_MCP_SKIP_HOST_HEADER_VERIFICATION must be true or false",
             )?;
         }
+        if let Ok(value) = env::var("CODE_INTERPRETER_MCP_MAX_FILE_KB") {
+            config.input_limits.max_file_kb = value.parse().context(
+                "CODE_INTERPRETER_MCP_MAX_FILE_KB must be a positive integer in KB (1 KB = 1024 bytes)",
+            )?;
+        }
+        if let Ok(value) = env::var("CODE_INTERPRETER_MCP_MAX_TOTAL_FILE_KB") {
+            config.input_limits.max_total_file_kb = value.parse().context(
+                "CODE_INTERPRETER_MCP_MAX_TOTAL_FILE_KB must be a positive integer in KB (1 KB = 1024 bytes)",
+            )?;
+        }
+        config.input_limits.validate()?;
         Ok(config)
     }
 
@@ -277,6 +292,44 @@ fn merge(base: &mut toml::Value, incoming: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_limits_default_parse_merge_and_validate() {
+        let defaults = AppConfig::from_files(&[]).unwrap();
+        assert_eq!(defaults.input_limits.max_file_kb, 10 * 1024);
+        assert_eq!(defaults.input_limits.max_total_file_kb, 50 * 1024);
+        let mut base: toml::Value =
+            toml::from_str("[input_limits]\nmax_file_kb = 40960\nmax_total_file_kb = 81920")
+                .unwrap();
+        merge(
+            &mut base,
+            toml::from_str("[input_limits]\nmax_file_kb = 51200").unwrap(),
+        );
+        let config: AppConfig = base.try_into().unwrap();
+        assert_eq!(config.input_limits.max_file_kb, 51200);
+        assert_eq!(config.input_limits.max_total_file_kb, 81920);
+        assert!(config.input_limits.validate().is_ok());
+        assert_eq!(
+            toml::from_str::<AppConfig>("[input_limits]\nmax_file_kb = 1")
+                .unwrap()
+                .input_limits
+                .max_total_file_kb,
+            50 * 1024
+        );
+        for value in ["-1", "1.5", "'3'", "true"] {
+            assert!(
+                toml::from_str::<AppConfig>(&format!("[input_limits]\nmax_file_kb = {value}"))
+                    .is_err()
+            );
+        }
+        for key in ["input_limits.max_file_kb", "input_limits.max_total_file_kb"] {
+            assert!(
+                crate::config_reference::generate_config_reference()
+                    .get(key)
+                    .is_some()
+            );
+        }
+    }
 
     #[test]
     fn search_min_hits_defaults_and_validates() {

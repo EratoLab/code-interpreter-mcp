@@ -12,6 +12,8 @@
   "code_snippets.snippets.<key>.tags.[]": {},
   "code_snippets.snippets.<key>.title": {},
   "http_allowed_hosts.[]": {},
+  "input_limits.max_file_kb": {},
+  "input_limits.max_total_file_kb": {},
   "package_cache_dir": {},
   "preinstall_packages.[]": {},
   "runtime_package_installation": {},

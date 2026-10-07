@@ -12,7 +12,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use axum::Router;
+use axum::{
+    Router,
+    http::StatusCode,
+    middleware,
+    response::{IntoResponse, Response},
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
     Json, ServerHandler,
@@ -30,14 +35,11 @@ use serde::{Deserialize, Serialize};
 
 mod runtime;
 use code_interpreter_mcp::config::{AppConfig, CodeSnippetsConfig};
+use code_interpreter_mcp::input_limits::{BYTES_PER_KB, InputLimits, MAX_CODE_BYTES, MAX_FILES};
 use runtime::PyodideRuntime;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 120_000;
-const MAX_CODE_BYTES: usize = 1024 * 1024;
-const MAX_FILES: usize = 64;
-const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
-const MAX_TOTAL_FILE_BYTES: usize = 50 * 1024 * 1024;
 const RUN_PYTHON_CODE_DESCRIPTION: &str = "Run Python code in a fresh Pyodide WebAssembly environment using a bounded worker queue. Queued calls may send MCP progress updates when the client supplies a progress token. Supports top-level await and Base64-encoded input files mounted below /workspace. Returns captured stdout, stderr, the final expression, Base64-encoded files created by the script, and a structured error when execution fails.";
 
 fn run_python_code_description(config: &AppConfig) -> String {
@@ -208,12 +210,14 @@ struct CodeInterpreterMcpServer {
     runtime: PyodideRuntime,
     code_snippets: CodeSnippetsConfig,
     search_min_hits: usize,
+    input_limits: InputLimits,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router(router = tool_router)]
 impl CodeInterpreterMcpServer {
     async fn new(config: &AppConfig) -> Result<Self> {
+        let input_limits = config.input_limits.validate()?;
         let code_snippets = CodeSnippetsConfig {
             enabled: config.code_snippets.enabled,
             snippets: config
@@ -231,6 +235,7 @@ impl CodeInterpreterMcpServer {
             runtime: PyodideRuntime::new(config).await?,
             code_snippets,
             search_min_hits: config.search.min_hits,
+            input_limits,
             tool_router: Self::configured_tool_router(config),
         })
     }
@@ -256,7 +261,7 @@ impl CodeInterpreterMcpServer {
         Parameters(request): Parameters<RunPythonCodeRequest>,
         context: RequestContext<RoleServer>,
     ) -> Json<RunPythonCodeOutput> {
-        let request = match validate_request(request) {
+        let request = match validate_request(request, self.input_limits) {
             Ok(request) => request,
             Err(error) => {
                 return Json(RunPythonCodeOutput::validation(error.to_string()));
@@ -435,7 +440,7 @@ fn snippet_is_included(id: &str, config: &CodeSnippetsConfig) -> bool {
         })
 }
 
-fn validate_request(request: RunPythonCodeRequest) -> Result<RuntimeRequest> {
+fn validate_request(request: RunPythonCodeRequest, limits: InputLimits) -> Result<RuntimeRequest> {
     if request.code.len() > MAX_CODE_BYTES {
         bail!("code exceeds the {MAX_CODE_BYTES} byte limit");
     }
@@ -457,21 +462,34 @@ fn validate_request(request: RunPythonCodeRequest) -> Result<RuntimeRequest> {
             bail!("duplicate file path: {path}");
         }
 
-        let max_encoded_len = MAX_FILE_BYTES.div_ceil(3) * 4;
-        if file.content_base64.len() > max_encoded_len {
-            bail!("file {path} exceeds the {MAX_FILE_BYTES} byte limit");
+        if file.content_base64.len() > limits.max_encoded_file_bytes() {
+            bail!(
+                "input file {path} exceeds the per-file limit: {} encoded bytes exceed the {} byte Base64 allowance (input_limits.max_file_kb = {} KB)",
+                file.content_base64.len(),
+                limits.max_encoded_file_bytes(),
+                limits.max_file_bytes() / BYTES_PER_KB
+            );
         }
         let decoded = BASE64
             .decode(file.content_base64.as_bytes())
             .with_context(|| format!("file {path} is not valid canonical Base64"))?;
-        if decoded.len() > MAX_FILE_BYTES {
-            bail!("file {path} exceeds the {MAX_FILE_BYTES} byte limit");
+        if decoded.len() > limits.max_file_bytes() {
+            bail!(
+                "input file {path} exceeds the per-file limit: {} decoded bytes > per-file allowance of {} decoded bytes (input_limits.max_file_kb = {} KB)",
+                decoded.len(),
+                limits.max_file_bytes(),
+                limits.max_file_bytes() / BYTES_PER_KB
+            );
         }
         total_bytes = total_bytes
             .checked_add(decoded.len())
             .ok_or_else(|| anyhow!("total file size overflowed"))?;
-        if total_bytes > MAX_TOTAL_FILE_BYTES {
-            bail!("files exceed the {MAX_TOTAL_FILE_BYTES} byte total limit");
+        if total_bytes > limits.max_total_file_bytes() {
+            bail!(
+                "input files exceed the aggregate limit at {path}: {total_bytes} decoded bytes > aggregate allowance of {} decoded bytes (input_limits.max_total_file_kb = {} KB)",
+                limits.max_total_file_bytes(),
+                limits.max_total_file_bytes() / BYTES_PER_KB
+            );
         }
 
         files.push(ValidatedFile {
@@ -510,8 +528,9 @@ fn validate_relative_path(value: &str) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-fn http_server_config(config: &AppConfig) -> StreamableHttpServerConfig {
-    let http_config = StreamableHttpServerConfig::default();
+fn http_server_config(config: &AppConfig, limits: InputLimits) -> StreamableHttpServerConfig {
+    let http_config = StreamableHttpServerConfig::default()
+        .with_max_request_body_bytes(limits.max_request_body_bytes());
     if config.skip_host_header_verification {
         http_config.disable_allowed_hosts()
     } else if config.http_allowed_hosts.is_empty() {
@@ -519,6 +538,28 @@ fn http_server_config(config: &AppConfig) -> StreamableHttpServerConfig {
     } else {
         http_config.with_allowed_hosts(config.http_allowed_hosts.clone())
     }
+}
+
+fn http_router(config: &AppConfig, server: CodeInterpreterMcpServer) -> Router {
+    let limits = server.input_limits;
+    let service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        LocalSessionManager::default().into(),
+        http_server_config(config, limits),
+    );
+    Router::new().nest_service("/mcp", service).layer(middleware::map_response(
+        move |response: Response| async move {
+            if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
+                return response;
+            }
+            let message = format!(
+                "HTTP payload too large: request body exceeds {} bytes. This ceiling is derived from input_limits.max_total_file_kb = {} KB, Base64 padding for up to {MAX_FILES} files, and JSON/RPC headroom. Increase the aggregate allowance for larger requests; input_limits.max_file_kb = {} KB still applies to each file.",
+                limits.max_request_body_bytes(), limits.max_total_file_bytes() / BYTES_PER_KB, limits.max_file_bytes() / BYTES_PER_KB
+            );
+            eprintln!("{message}");
+            (StatusCode::PAYLOAD_TOO_LARGE, message).into_response()
+        },
+    ))
 }
 
 #[tokio::main]
@@ -530,12 +571,13 @@ async fn main() -> Result<()> {
         .with_context(|| format!("invalid bind_addr: {}", config.bind_addr))?;
 
     let server = CodeInterpreterMcpServer::new(&config).await?;
-    let http_service = StreamableHttpService::new(
-        move || Ok(server.clone()),
-        LocalSessionManager::default().into(),
-        http_server_config(&config),
+    eprintln!(
+        "Input size limits: {} decoded bytes per file, {} decoded bytes total; HTTP request body ceiling: {} bytes",
+        server.input_limits.max_file_bytes(),
+        server.input_limits.max_total_file_bytes(),
+        server.input_limits.max_request_body_bytes(),
     );
-    let router = Router::new().nest_service("/mcp", http_service);
+    let router = http_router(&config, server);
     let listener = tokio::net::TcpListener::bind(bind_address)
         .await
         .with_context(|| format!("failed to bind MCP HTTP server to {bind_address}"))?;
@@ -730,12 +772,7 @@ mod tests {
             config.workers.queue_capacity = 1;
             config.workers.prewarmed_workers = 0;
             let server = CodeInterpreterMcpServer::new(&config).await.unwrap();
-            let service = StreamableHttpService::new(
-                move || Ok(server.clone()),
-                LocalSessionManager::default().into(),
-                http_server_config(&config),
-            );
-            let router = Router::new().nest_service("/mcp", service);
+            let router = http_router(&config, server);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/mcp", listener.local_addr().unwrap());
             let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -775,9 +812,206 @@ mod tests {
         }
     }
 
+    fn default_limits() -> InputLimits {
+        code_interpreter_mcp::input_limits::InputLimitsConfig::default()
+            .validate()
+            .unwrap()
+    }
+
+    fn limits(file: usize, total: usize) -> InputLimits {
+        code_interpreter_mcp::input_limits::InputLimitsConfig {
+            max_file_kb: file,
+            max_total_file_kb: total,
+        }
+        .validate()
+        .unwrap()
+    }
+
+    fn multi_file_request(sizes: &[usize]) -> RunPythonCodeRequest {
+        RunPythonCodeRequest {
+            code: "pass".to_owned(),
+            files: sizes
+                .iter()
+                .enumerate()
+                .map(|(index, size)| InputFile {
+                    path: format!("file-{index}.bin"),
+                    content_base64: BASE64.encode(vec![0; *size]),
+                })
+                .collect(),
+            timeout_ms: None,
+        }
+    }
+
+    fn rpc_request(input: &RunPythonCodeRequest) -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "run_python_code", "arguments": {
+                "code": input.code, "timeout_ms": input.timeout_ms,
+                "files": input.files.iter().map(|file| serde_json::json!({
+                    "path": file.path, "content_base64": file.content_base64
+                })).collect::<Vec<_>>()
+            }}
+        })
+    }
+
+    #[test]
+    fn configured_file_and_aggregate_boundaries() {
+        // One or two padding bytes can mask a decoded overrun if only the
+        // encoded length is checked. Exercise every remainder modulo three.
+        for max_file_kb in [1, 2, 3, 4, 5, 6] {
+            let policy = limits(max_file_kb, max_file_kb * 2);
+            let max_file = max_file_kb * BYTES_PER_KB;
+            assert!(validate_request(multi_file_request(&[max_file, max_file]), policy).is_ok());
+            let error = validate_request(multi_file_request(&[max_file + 1]), policy)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("per-file limit"), "{error}");
+            assert!(error.contains("input_limits.max_file_kb"), "{error}");
+        }
+        let error = validate_request(multi_file_request(&[4096, 2049]), limits(4, 6))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("aggregate limit"), "{error}");
+        assert!(error.contains("6145 decoded bytes"), "{error}");
+        assert!(
+            error.contains("input_limits.max_total_file_kb = 6 KB"),
+            "{error}"
+        );
+        assert!(validate_request(multi_file_request(&[0, 0]), limits(1, 1)).is_ok());
+        assert!(
+            validate_request(multi_file_request(&[1; MAX_FILES]), limits(1, MAX_FILES)).is_ok()
+        );
+        assert!(
+            validate_request(multi_file_request(&[0; MAX_FILES + 1]), default_limits()).is_err()
+        );
+    }
+
+    #[test]
+    fn permits_incident_file_and_multiple_large_files_with_json_overhead() {
+        let policy = limits(50 * 1024, 100 * 1024);
+        let input = multi_file_request(&[41_943_090, 40 * 1024 * 1024]);
+        assert!(
+            serde_json::to_vec(&rpc_request(&input)).unwrap().len()
+                < policy.max_request_body_bytes()
+        );
+        assert!(validate_request(input, policy).is_ok());
+
+        let policy = limits(1, MAX_FILES);
+        let mut input = multi_file_request(&[1; MAX_FILES]);
+        input.code = "\0".repeat(MAX_CODE_BYTES); // Worst-case JSON escaping of source.
+        for file in &mut input.files {
+            file.path.push_str(&"\u{1}".repeat(4096));
+        }
+        assert!(
+            serde_json::to_vec(&rpc_request(&input)).unwrap().len()
+                <= policy.max_request_body_bytes()
+        );
+        assert!(validate_request(input, policy).is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_size_policy_admits_large_payloads_and_reports_each_rejection() {
+        let mut config: AppConfig = toml::from_str("").unwrap();
+        config.workers.prewarmed_workers = 0;
+        config.input_limits.max_file_kb = 50 * 1024;
+        config.input_limits.max_total_file_kb = 60 * 1024;
+        let policy = config.input_limits.validate().unwrap();
+        let server = CodeInterpreterMcpServer::new(&config).await.unwrap();
+        let router = http_router(&config, server);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let post = || {
+            client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+        };
+        let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"size-test","version":"1"}}}"#;
+        let response = post().body(initialize).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let session = response.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        // Finish initialize before using tools/call.
+        let _ = response.text().await.unwrap();
+        let response = post()
+            .header("Mcp-Session-Id", &session)
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .body(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        for sizes in [vec![41_943_090], vec![30 * 1024 * 1024; 2]] {
+            let mut input = multi_file_request(&sizes);
+            assert!(validate_request(multi_file_request(&sizes), policy).is_ok());
+            // A timeout validation error proves transport delivery without
+            // starting Pyodide or running any user code in this transport test.
+            input.timeout_ms = Some(0);
+            let response = post()
+                .header("Mcp-Session-Id", &session)
+                .header("MCP-Protocol-Version", "2025-11-25")
+                .body(serde_json::to_vec(&rpc_request(&input)).unwrap())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.text().await.unwrap();
+            assert!(body.contains("timeout_ms must be between"), "{body}");
+        }
+        // Size errors return through tools/call before submitting a runtime job.
+        for (sizes, message) in [
+            (vec![50 * 1024 * 1024 + 1], "per-file limit"),
+            (
+                vec![30 * 1024 * 1024, 30 * 1024 * 1024 + 1],
+                "aggregate limit",
+            ),
+        ] {
+            let input = multi_file_request(&sizes);
+            let response = post()
+                .header("Mcp-Session-Id", &session)
+                .header("MCP-Protocol-Version", "2025-11-25")
+                .body(serde_json::to_vec(&rpc_request(&input)).unwrap())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.text().await.unwrap();
+            assert!(body.contains(message), "{body}");
+            assert!(body.contains("validation"), "{body}");
+        }
+        for (extra_bytes, expected_status) in
+            [(0, StatusCode::OK), (1, StatusCode::PAYLOAD_TOO_LARGE)]
+        {
+            let mut body = initialize.as_bytes().to_vec();
+            body.resize(policy.max_request_body_bytes() + extra_bytes, b' ');
+            let response = post().body(body).send().await.unwrap();
+            assert_eq!(response.status(), expected_status);
+            if extra_bytes == 1 {
+                let body = response.text().await.unwrap();
+                assert!(body.contains("HTTP payload too large"), "{body}");
+                assert!(
+                    body.contains(&policy.max_request_body_bytes().to_string()),
+                    "{body}"
+                );
+                assert!(body.contains("input_limits.max_total_file_kb"), "{body}");
+            }
+        }
+        task.abort();
+    }
+
     #[test]
     fn accepts_nested_file_path() {
-        let validated = validate_request(request("data/input.bin", b"hello")).unwrap();
+        let validated =
+            validate_request(request("data/input.bin", b"hello"), default_limits()).unwrap();
         assert_eq!(validated.files[0].path, "data/input.bin");
         assert_eq!(validated.timeout_ms, DEFAULT_TIMEOUT_MS);
     }
@@ -785,7 +1019,10 @@ mod tests {
     #[test]
     fn rejects_path_traversal_and_absolute_paths() {
         for path in ["../secret", "data/../secret", "/etc/passwd", "a\\b"] {
-            assert!(validate_request(request(path, b"x")).is_err(), "{path}");
+            assert!(
+                validate_request(request(path, b"x"), default_limits()).is_err(),
+                "{path}"
+            );
         }
     }
 
@@ -793,7 +1030,7 @@ mod tests {
     fn rejects_invalid_base64() {
         let mut input = request("input.bin", b"");
         input.files[0].content_base64 = "not base64".to_owned();
-        assert!(validate_request(input).is_err());
+        assert!(validate_request(input, default_limits()).is_err());
     }
 
     #[test]
