@@ -364,14 +364,30 @@ impl CodeInterpreterMcpServer {
 )]
 impl ServerHandler for CodeInterpreterMcpServer {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        // This endpoint implements Streamable HTTP's initialize lifecycle.
-        // 2024-11-05 uses the superseded HTTP+SSE transport, while 2026-07-28
-        // removes initialize and requires per-request protocol metadata.
+        // Older protocol versions use Streamable HTTP's initialize lifecycle.
+        // The 2026-07-28 protocol uses stateless request metadata instead; rmcp
+        // routes it through the stateless HTTP path while keeping legacy clients
+        // on sessions.
         Cow::Borrowed(&[
             ProtocolVersion::V_2025_03_26,
             ProtocolVersion::V_2025_06_18,
             ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2026_07_28,
         ])
+    }
+
+    fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<rmcp::model::DiscoverResult, rmcp::ErrorData>> + Send + '_ {
+        std::future::ready(Ok(
+            rmcp::model::DiscoverResult::from_server_info(
+                self.supported_protocol_versions().into_owned(),
+                self.get_info(),
+            )
+            .with_ttl_ms(0)
+            .with_cache_scope(rmcp::model::CacheScope::Public),
+        ))
     }
 }
 
