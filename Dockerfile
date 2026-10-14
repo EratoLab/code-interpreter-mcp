@@ -26,6 +26,8 @@ RUN cargo build --release --locked --bin code-interpreter-mcp
 # Pinned for security & performance reasons.
 FROM debian:bookworm-slim@sha256:e899040a73d36e2b36fa33216943539d9957cba8172b858097c2cabcdb20a3e2
 
+LABEL org.opencontainers.image.licenses="MIT"
+
 WORKDIR /app
 
 # hadolint ignore=DL3008
@@ -35,6 +37,7 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/code-interpreter-mcp /app/code-interpreter-mcp
+COPY LICENSE /app/LICENSE
 COPY --from=pyodide-assets /app/node_modules/pyodide /app/node_modules/pyodide
 
 RUN useradd -m -u 1000 appuser && \

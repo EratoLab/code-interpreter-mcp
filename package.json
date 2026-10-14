@@ -1,6 +1,7 @@
 {
   "name": "code-interpreter-mcp-runtime",
   "private": true,
+  "license": "MIT",
   "dependencies": {
     "pyodide": "314.0.2"
   }
