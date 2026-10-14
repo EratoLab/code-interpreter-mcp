@@ -5,6 +5,11 @@ in a fresh [Pyodide](https://pyodide.org/) WebAssembly instance embedded
 directly in Rust through `deno_core`; no browser, Node.js process, Bun process,
 or Deno executable is used at runtime.
 
+The server supports MCP protocol versions through `2026-07-28`. Clients using
+`2026-07-28` communicate through stateless requests without an initialize
+handshake or session ID. Clients using earlier supported protocol versions
+continue to use the Streamable HTTP session lifecycle.
+
 ## Architecture
 
 ```text
