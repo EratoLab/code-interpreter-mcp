@@ -14,6 +14,8 @@ const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:8000";
 const DEFAULT_MAX_WORKERS: usize = 2;
 const DEFAULT_QUEUE_CAPACITY: usize = 8;
 const DEFAULT_PREWARMED_WORKERS: usize = 1;
+const DEFAULT_MEMORY_LIMIT_MB: usize = 512;
+const BYTES_PER_MB: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Facet)]
 pub struct AppConfig {
@@ -62,6 +64,8 @@ pub struct WorkersConfig {
     pub queue_capacity: usize,
     #[serde(default = "default_prewarmed_workers")]
     pub prewarmed_workers: usize,
+    /// Per-isolate V8 heap budget in MB (1 MB = 1,048,576 bytes), default 512.
+    pub memory_limit_mb: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Facet)]
@@ -181,6 +185,7 @@ impl AppConfig {
     }
 
     pub fn validate_worker_settings(&self) -> Result<()> {
+        self.workers.memory_limit_bytes()?;
         if self.workers.max_workers == 0 {
             bail!("max_workers must be greater than zero");
         }
@@ -214,7 +219,19 @@ impl Default for WorkersConfig {
             max_workers: default_max_workers(),
             queue_capacity: default_queue_capacity(),
             prewarmed_workers: default_prewarmed_workers(),
+            memory_limit_mb: DEFAULT_MEMORY_LIMIT_MB,
         }
+    }
+}
+
+impl WorkersConfig {
+    pub fn memory_limit_bytes(&self) -> Result<usize> {
+        if self.memory_limit_mb == 0 {
+            bail!("workers.memory_limit_mb must be greater than zero");
+        }
+        self.memory_limit_mb.checked_mul(BYTES_PER_MB).context(
+            "workers.memory_limit_mb is too large: conversion to bytes overflows (1 MB = 1,048,576 bytes)",
+        )
     }
 }
 
@@ -292,6 +309,66 @@ fn merge(base: &mut toml::Value, incoming: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_memory_limit_defaults_and_overrides() {
+        for source in ["", "[workers]", "[workers]\nmax_workers = 4"] {
+            let config: AppConfig = toml::from_str(source).unwrap();
+            assert_eq!(config.workers.memory_limit_mb, 512);
+            assert_eq!(
+                config.workers.memory_limit_bytes().unwrap(),
+                512 * 1024 * 1024
+            );
+            config.validate_worker_settings().unwrap();
+        }
+        let mut base: toml::Value =
+            toml::from_str("[workers]\nmemory_limit_mb = 512\nmax_workers = 4").unwrap();
+        merge(
+            &mut base,
+            toml::from_str("[workers]\nmemory_limit_mb = 1024").unwrap(),
+        );
+        let config: AppConfig = base.try_into().unwrap();
+        assert_eq!(config.workers.memory_limit_mb, 1024);
+        assert_eq!(
+            config.workers.memory_limit_bytes().unwrap(),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(config.workers.max_workers, 4);
+        config.validate_worker_settings().unwrap();
+        assert!(
+            crate::config_reference::generate_config_reference()
+                .get("workers.memory_limit_mb")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn worker_memory_limit_rejects_invalid_values_and_overflow() {
+        for value in ["-1", "1.5", "'512'", "true", "18446744073709551616"] {
+            let error =
+                toml::from_str::<AppConfig>(&format!("[workers]\nmemory_limit_mb = {value}"))
+                    .unwrap_err();
+            assert!(error.to_string().contains("memory_limit_mb"), "{error}");
+        }
+        for value in [0, usize::MAX / BYTES_PER_MB + 1] {
+            let config: AppConfig =
+                toml::from_str(&format!("[workers]\nmemory_limit_mb = {value}")).unwrap();
+            let error = config.validate_worker_settings().unwrap_err();
+            assert!(error.to_string().contains("workers.memory_limit_mb"));
+            assert!(error.to_string().contains(if value == 0 {
+                "greater than zero"
+            } else {
+                "overflows"
+            }));
+        }
+        for value in [1, usize::MAX / BYTES_PER_MB] {
+            let workers = WorkersConfig {
+                memory_limit_mb: value,
+                ..WorkersConfig::default()
+            };
+            assert_eq!(workers.memory_limit_bytes().unwrap(), value * BYTES_PER_MB);
+        }
+    }
 
     #[test]
     fn input_limits_default_parse_merge_and_validate() {

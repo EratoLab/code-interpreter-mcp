@@ -20,6 +20,7 @@
   "search.min_hits": {},
   "skip_host_header_verification": {},
   "workers.max_workers": {},
+  "workers.memory_limit_mb": {},
   "workers.prewarmed_workers": {},
   "workers.queue_capacity": {}
 }

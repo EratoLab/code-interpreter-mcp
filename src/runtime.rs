@@ -36,6 +36,7 @@ const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Clone)]
 struct RuntimeConfig {
+    memory_limit_bytes: usize,
     allowed_hosts: Arc<HashSet<String>>,
     asset_dir: Arc<PathBuf>,
     client: reqwest::Client,
@@ -291,6 +292,7 @@ impl PyodideRuntime {
             .expect("the static HTTP client configuration is valid");
 
         let mut runtime_config = RuntimeConfig {
+            memory_limit_bytes: config.workers.memory_limit_bytes()?,
             preinstall_packages: config.preinstall_packages.clone(),
             runtime_package_installation: config.runtime_package_installation,
             package_cache_dir: Arc::new(config.package_cache_dir()),
@@ -460,7 +462,7 @@ fn create_runtime(config: &RuntimeConfig) -> Result<JsRuntime> {
         .collect::<Result<Vec<_>>>()?;
     JsRuntime::try_new(RuntimeOptions {
         extensions,
-        create_params: Some(v8::Isolate::create_params().heap_limits(0, 512 * 1024 * 1024)),
+        create_params: Some(v8::Isolate::create_params().heap_limits(0, config.memory_limit_bytes)),
         ..Default::default()
     })
     .context("could not initialize the embedded Deno runtime")
@@ -881,6 +883,33 @@ async fn fetch_url(config: &RuntimeConfig, raw_url: &str) -> Result<Arc<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_applies_heap_limit_to_fresh_isolates() {
+        for source in ["", "[workers]\nmemory_limit_mb = 1024"] {
+            let config: AppConfig = toml::from_str(source).unwrap();
+            let runtime_config = RuntimeConfig {
+                memory_limit_bytes: config.workers.memory_limit_bytes().unwrap(),
+                allowed_hosts: Arc::new(HashSet::new()),
+                asset_dir: Arc::new(PathBuf::new()),
+                client: reqwest::Client::new(),
+                download_cache: Arc::new(Mutex::new(HashMap::new())),
+                content_types: Arc::new(Mutex::new(HashMap::new())),
+                preinstall_packages: Vec::new(),
+                runtime_package_installation: true,
+                package_cache_dir: Arc::new(PathBuf::new()),
+                package_layer: None,
+            };
+            // Startup, cold workers and warm replacements share this factory.
+            for _ in 0..2 {
+                let mut runtime = create_runtime(&runtime_config.clone()).unwrap();
+                assert_eq!(
+                    runtime.v8_isolate().get_heap_statistics().heap_size_limit(),
+                    runtime_config.memory_limit_bytes,
+                );
+            }
+        }
+    }
 
     async fn run(runtime: &PyodideRuntime, code: &str) -> RunPythonCodeOutput {
         runtime
