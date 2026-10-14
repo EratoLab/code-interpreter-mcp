@@ -416,3 +416,9 @@ cargo test
 cargo test package_policy_in_fresh_sandboxes -- --ignored --nocapture
 cargo clippy --all-targets --all-features -- -D warnings
 ```
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+Third-party dependencies retain their respective licenses.
