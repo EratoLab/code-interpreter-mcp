@@ -224,6 +224,44 @@ repository.
 
 ## Configuration and limits
 
+### Health probes and shutdown
+
+The existing HTTP listener serves ordinary `GET /livez` and `GET /readyz`
+requests without MCP initialization or session headers. Successful probes return
+HTTP **200** with `ok`; unhealthy probes return **503** with `unavailable`.
+Probe routes accept Pod-IP Host headers. Host verification remains enforced on
+`/mcp` according to the settings below.
+
+- `/livez` succeeds while HTTP responds and no unrecoverable worker-pool failure
+  is known. Losing all workers unexpectedly, or poisoning the internal worker
+  queue, fails liveness.
+- `/readyz` additionally requires the pool to accept submissions and have at
+  least one live worker. Busy workers count as alive. Partial worker loss leaves
+  the pool ready while surviving workers remain operational; workers are not
+  automatically restarted.
+
+Probes only read shared atomics. They do not lock the execution queue, run Python,
+enqueue work, or access package registries. Queue saturation, individual script
+errors, and package download failures do not fail probes. A full queue continues
+to return the existing structured overload error.
+
+The listener is bound only after asset checks, configured package preparation,
+and worker startup acknowledgements complete. Connection failures during startup
+are expected; failed initialization does not expose a ready server. Configure
+`workers.prewarmed_workers >= 1` for readiness to imply that Python initialized
+successfully. With `prewarmed_workers = 0`, startup confirms worker thread creation
+and asset presence, but does not initialize Pyodide. These probes do not detect
+live workers stuck inside initialization.
+
+SIGTERM (on Unix) or Ctrl-C starts a **30-second total shutdown deadline**.
+Readiness immediately fails and new execution submissions are rejected with a
+structured runtime error. Queued executions are cancelled immediately with a
+runtime error; active executions may finish within the deadline. Liveness stays
+successful during normal draining, and the listener continues serving probes
+until workers exit. HTTP then shuts down gracefully. The same deadline bounds
+persistent MCP streams and remaining active work; at the deadline the process
+exits even if workers or streams have not finished.
+
 ### Queue and workers
 
 The HTTP server's Tokio runtime defaults to the detected available parallelism,

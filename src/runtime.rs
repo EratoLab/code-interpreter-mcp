@@ -7,7 +7,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::Duration,
@@ -77,8 +77,52 @@ struct QueueState {
     closed: bool,
 }
 
+/// Probe reads never acquire the queue mutex or depend on Python execution.
+#[derive(Default)]
+pub(crate) struct WorkerHealth {
+    accepting: AtomicBool,
+    live_workers: AtomicUsize,
+    fatal: AtomicBool,
+}
+
+impl WorkerHealth {
+    pub(crate) fn is_live(&self) -> bool {
+        !self.fatal.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        self.accepting.load(Ordering::Acquire) && self.live_workers() > 0 && self.is_live()
+    }
+
+    pub(crate) fn live_workers(&self) -> usize {
+        self.live_workers.load(Ordering::Acquire)
+    }
+}
+
+/// Lives for the entire worker thread, including startup and panic unwinding.
+pub(crate) struct WorkerGuard(Arc<WorkerQueue>);
+
+impl WorkerGuard {
+    fn new(queue: Arc<WorkerQueue>) -> Self {
+        queue.health.live_workers.fetch_add(1, Ordering::AcqRel);
+        Self(queue)
+    }
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        let last = self.0.health.live_workers.fetch_sub(1, Ordering::AcqRel) == 1;
+        if self.0.state.is_poisoned() || (last && !self.0.stopping.load(Ordering::Acquire)) {
+            self.0.health.fatal.store(true, Ordering::Release);
+            self.0.shutdown();
+        }
+    }
+}
+
 struct WorkerQueue {
     capacity: usize,
+    health: Arc<WorkerHealth>,
+    stopping: AtomicBool,
     state: Mutex<QueueState>,
     ready: Condvar,
     next_id: AtomicU64,
@@ -88,6 +132,8 @@ impl WorkerQueue {
     fn new(capacity: usize) -> Self {
         Self {
             capacity,
+            health: Arc::new(WorkerHealth::default()),
+            stopping: AtomicBool::new(false),
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
             next_id: AtomicU64::new(1),
@@ -99,8 +145,13 @@ impl WorkerQueue {
         request: RuntimeRequest,
         cancelled: Arc<AtomicBool>,
     ) -> Result<(u64, oneshot::Receiver<RunPythonCodeOutput>), RuntimeRequest> {
-        let mut state = self.state.lock().expect("worker queue mutex poisoned");
-        if state.closed || state.requests.len() >= self.capacity {
+        if !self.health.is_ready() {
+            return Err(request);
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return Err(request);
+        };
+        if state.closed || !self.health.is_ready() || state.requests.len() >= self.capacity {
             return Err(request);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -140,17 +191,24 @@ impl WorkerQueue {
 
     fn cancel(&self, id: u64) {
         let mut state = self.state.lock().expect("worker queue mutex poisoned");
-        if let Some(index) = state.requests.iter().position(|request| request.id == id) {
-            if let Some(request) = state.requests.remove(index) {
-                request.cancelled.store(true, Ordering::Release);
-            }
+        if let Some(index) = state.requests.iter().position(|request| request.id == id)
+            && let Some(request) = state.requests.remove(index)
+        {
+            request.cancelled.store(true, Ordering::Release);
         }
     }
 
     fn shutdown(&self) {
-        let mut state = self.state.lock().expect("worker queue mutex poisoned");
+        self.stopping.store(true, Ordering::Release);
+        self.health.accepting.store(false, Ordering::Release);
+        // Recover poison here so a worker's unwind guard cannot double-panic.
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.closed = true;
-        state.requests.clear();
+        for job in state.requests.drain(..) {
+            let _ = job.response.send(RunPythonCodeOutput::runtime(
+                "Worker pool stopped before queued execution could start",
+            ));
+        }
         self.ready.notify_all();
     }
 }
@@ -262,6 +320,19 @@ pub(crate) struct PyodideRuntime {
 }
 
 impl PyodideRuntime {
+    #[cfg(test)]
+    pub(crate) fn test_pool() -> (Self, WorkerGuard) {
+        let queue = Arc::new(WorkerQueue::new(1));
+        let guard = WorkerGuard::new(queue.clone());
+        queue.health.accepting.store(true, Ordering::Release);
+        (
+            Self {
+                pool: Arc::new(WorkerPoolOwner { queue }),
+            },
+            guard,
+        )
+    }
+
     pub(crate) async fn new(config: &AppConfig) -> Result<Self> {
         config.validate_worker_settings()?;
         let mut allowed_hosts = config
@@ -341,9 +412,22 @@ impl PyodideRuntime {
             }
         }
 
+        queue.health.accepting.store(true, Ordering::Release);
+        if !queue.health.is_ready() {
+            queue.shutdown();
+            bail!("worker pool failed during startup");
+        }
         Ok(Self {
             pool: Arc::new(WorkerPoolOwner { queue }),
         })
+    }
+
+    pub(crate) fn health(&self) -> Arc<WorkerHealth> {
+        self.pool.queue.health.clone()
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.pool.queue.shutdown();
     }
 
     pub(crate) fn submit(
@@ -379,6 +463,7 @@ fn worker_thread(
     prewarmed: bool,
     started: tokio::sync::mpsc::Sender<Result<(), String>>,
 ) {
+    let _guard = WorkerGuard::new(queue.clone());
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -401,6 +486,7 @@ fn worker_thread(
         None
     };
     let _ = started.blocking_send(Ok(()));
+    drop(started);
 
     loop {
         let Some(job) = queue.next() else {
@@ -432,7 +518,7 @@ fn worker_thread(
 
         // The request isolate is discarded. Build a clean replacement before
         // this worker becomes warm for its next request.
-        if prewarmed {
+        if prewarmed && !queue.stopping.load(Ordering::Acquire) {
             match runtime.block_on(create_initialized_isolate(&config, false)) {
                 Ok(isolate) => prepared = Some(isolate),
                 Err(error) => {
@@ -909,6 +995,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn request() -> RuntimeRequest {
+        RuntimeRequest {
+            code: "pass".into(),
+            files: vec![],
+            timeout_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn probes_ignore_queue_lock_and_saturation_and_shutdown_cancels_queue() {
+        let (runtime, worker) = PyodideRuntime::test_pool();
+        let (_, mut active_response) = runtime
+            .submit(request(), Arc::new(AtomicBool::new(false)))
+            .ok()
+            .unwrap();
+        let active_job = runtime.pool.queue.next().unwrap();
+        let (_, mut response) = runtime
+            .submit(request(), Arc::new(AtomicBool::new(false)))
+            .ok()
+            .unwrap();
+        assert!(
+            runtime
+                .submit(request(), Arc::new(AtomicBool::new(false)))
+                .is_err()
+        );
+        {
+            let _lock = runtime.pool.queue.state.lock().unwrap();
+            assert!(runtime.health().is_live());
+            assert!(runtime.health().is_ready());
+        }
+        runtime.shutdown();
+        assert!(runtime.health().is_live());
+        assert!(!runtime.health().is_ready());
+        assert!(!response.try_recv().unwrap().success);
+        assert!(matches!(
+            active_response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        active_job
+            .response
+            .send(RunPythonCodeOutput::runtime("individual script error"))
+            .unwrap();
+        assert!(!active_response.try_recv().unwrap().success);
+        assert!(runtime.health().is_live());
+        assert!(
+            runtime
+                .submit(request(), Arc::new(AtomicBool::new(false)))
+                .is_err()
+        );
+        assert!(runtime.pool.queue.next().is_none());
+        drop(worker);
+        assert_eq!(runtime.health().live_workers(), 0);
+        assert!(runtime.health().is_live());
+    }
+
+    #[test]
+    fn worker_panic_tracks_partial_and_total_loss() {
+        let (runtime, first) = PyodideRuntime::test_pool();
+        let second = WorkerGuard::new(runtime.pool.queue.clone());
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = first;
+                panic!("worker failed");
+            })
+            .join()
+            .is_err()
+        );
+        assert_eq!(runtime.health().live_workers(), 1);
+        assert!(runtime.health().is_ready());
+        let (_, mut response) = runtime
+            .submit(request(), Arc::new(AtomicBool::new(false)))
+            .ok()
+            .unwrap();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = second;
+                panic!("last worker failed");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(!runtime.health().is_live());
+        assert!(!runtime.health().is_ready());
+        assert!(!response.try_recv().unwrap().success);
+    }
+
+    #[test]
+    fn poisoned_queue_is_fatal_even_with_surviving_workers() {
+        let (runtime, first) = PyodideRuntime::test_pool();
+        let second = WorkerGuard::new(runtime.pool.queue.clone());
+        let queue = runtime.pool.queue.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = first;
+                let _lock = queue.state.lock().unwrap();
+                panic!("queue failure");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(!runtime.health().is_live());
+        assert!(!runtime.health().is_ready());
+        assert!(
+            runtime
+                .submit(request(), Arc::new(AtomicBool::new(false)))
+                .is_err()
+        );
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn missing_assets_fail_startup() {
+        let mut config: AppConfig = toml::from_str("").unwrap();
+        config.asset_dir = Some(PathBuf::from("/nonexistent-ermcp-assets"));
+        assert!(PyodideRuntime::new(&config).await.is_err());
     }
 
     async fn run(runtime: &PyodideRuntime, code: &str) -> RunPythonCodeOutput {

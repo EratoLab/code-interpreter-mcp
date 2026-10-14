@@ -17,6 +17,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::{IntoResponse, Response},
+    routing::get,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rmcp::{
@@ -272,6 +273,11 @@ impl CodeInterpreterMcpServer {
         let cancellation = Arc::new(AtomicBool::new(false));
         let (job_id, mut response) = match self.runtime.submit(request, cancellation.clone()) {
             Ok(submitted) => submitted,
+            Err(_) if !self.runtime.health().is_ready() => {
+                return Json(RunPythonCodeOutput::runtime(
+                    "Worker pool is not accepting executions",
+                ));
+            }
             Err(_) => return Json(RunPythonCodeOutput::overloaded()),
         };
 
@@ -380,15 +386,14 @@ impl ServerHandler for CodeInterpreterMcpServer {
     fn discover(
         &self,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<rmcp::model::DiscoverResult, rmcp::ErrorData>> + Send + '_ {
-        std::future::ready(Ok(
-            rmcp::model::DiscoverResult::from_server_info(
-                self.supported_protocol_versions().into_owned(),
-                self.get_info(),
-            )
-            .with_ttl_ms(0)
-            .with_cache_scope(rmcp::model::CacheScope::Public),
-        ))
+    ) -> impl Future<Output = Result<rmcp::model::DiscoverResult, rmcp::ErrorData>> + Send + '_
+    {
+        std::future::ready(Ok(rmcp::model::DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        )
+        .with_ttl_ms(0)
+        .with_cache_scope(rmcp::model::CacheScope::Public)))
     }
 }
 
@@ -558,13 +563,18 @@ fn http_server_config(config: &AppConfig, limits: InputLimits) -> StreamableHttp
 }
 
 fn http_router(config: &AppConfig, server: CodeInterpreterMcpServer) -> Router {
+    let health = server.runtime.health();
+    let ready_health = health.clone();
     let limits = server.input_limits;
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         LocalSessionManager::default().into(),
         http_server_config(config, limits),
     );
-    Router::new().nest_service("/mcp", service).layer(middleware::map_response(
+    Router::new()
+        .route("/livez", get(move || async move { probe_response(health.is_live()) }))
+        .route("/readyz", get(move || async move { probe_response(ready_health.is_ready()) }))
+        .nest_service("/mcp", service).layer(middleware::map_response(
         move |response: Response| async move {
             if response.status() != StatusCode::PAYLOAD_TOO_LARGE {
                 return response;
@@ -579,13 +589,89 @@ fn http_router(config: &AppConfig, server: CodeInterpreterMcpServer) -> Router {
     ))
 }
 
+fn probe_response(healthy: bool) -> (StatusCode, &'static str) {
+    if healthy {
+        (StatusCode::OK, "ok\n")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable\n")
+    }
+}
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("failed to install SIGTERM handler")?;
+        tokio::select! {
+            _ = terminate.recv() => {},
+            result = tokio::signal::ctrl_c() => result.context("failed to listen for Ctrl-C")?,
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to listen for Ctrl-C")?;
+    Ok(())
+}
+
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    runtime: PyodideRuntime,
+    signal: impl Future<Output = Result<()>>,
+    drain_timeout: Duration,
+) -> Result<()> {
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = stop_rx.await;
+        })
+        .into_future();
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => return result.context("MCP Streamable HTTP server failed"),
+        result = signal => result?,
+    }
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    runtime.shutdown();
+    eprintln!(
+        "Shutdown started: queued work cancelled; draining active work for up to {drain_timeout:?}"
+    );
+    // Keep serving probes while active workers drain. No new executions are accepted.
+    let drain = async {
+        while runtime.health().live_workers() > 0 {
+            tokio::select! {
+                result = &mut serving => return result.context("MCP Streamable HTTP server failed"),
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+            }
+        }
+        let _ = stop_tx.send(());
+        (&mut serving)
+            .await
+            .context("MCP Streamable HTTP server failed")
+    };
+    match tokio::time::timeout_at(deadline, drain).await {
+        Ok(result) => result,
+        Err(_) => {
+            eprintln!("Shutdown deadline reached; cutting off remaining work and HTTP streams");
+            Ok(())
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(tokio_workers::configured_worker_threads())
         .enable_all()
         .build()
         .context("failed to build Tokio runtime")?;
-    runtime.block_on(async_main())
+    let result = runtime.block_on(async_main());
+    // Do not let persistent HTTP streams or blocking tasks extend the deadline.
+    runtime.shutdown_timeout(Duration::ZERO);
+    result
 }
 
 async fn async_main() -> Result<()> {
@@ -602,6 +688,7 @@ async fn async_main() -> Result<()> {
         server.input_limits.max_total_file_bytes(),
         server.input_limits.max_request_body_bytes(),
     );
+    let worker_runtime = server.runtime.clone();
     let router = http_router(&config, server);
     let listener = tokio::net::TcpListener::bind(bind_address)
         .await
@@ -618,15 +705,220 @@ async fn async_main() -> Result<()> {
         .flush()
         .context("failed to flush MCP HTTP startup announcement")?;
 
-    axum::serve(listener, router)
-        .await
-        .context("MCP Streamable HTTP server failed")
+    serve_until_shutdown(
+        listener,
+        router,
+        worker_runtime,
+        shutdown_signal(),
+        SHUTDOWN_TIMEOUT,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    fn test_server(runtime: PyodideRuntime) -> (AppConfig, CodeInterpreterMcpServer) {
+        let config: AppConfig = toml::from_str("").unwrap();
+        let server = CodeInterpreterMcpServer {
+            runtime,
+            code_snippets: config.code_snippets.clone(),
+            search_min_hits: config.search.min_hits,
+            input_limits: config.input_limits.validate().unwrap(),
+            tool_router: CodeInterpreterMcpServer::configured_tool_router(&config),
+        };
+        (config, server)
+    }
+
+    async fn check_probe(client: &reqwest::Client, base: &str, path: &str, status: StatusCode) {
+        let response = client
+            .get(format!("{base}/{path}"))
+            .header("Host", "10.42.0.17:8000")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.text().await.unwrap(),
+            if status == StatusCode::OK {
+                "ok\n"
+            } else {
+                "unavailable\n"
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn probes_accept_pod_hosts_and_report_saturation_and_worker_loss() {
+        let (runtime, worker) = PyodideRuntime::test_pool();
+        let (config, server) = test_server(runtime.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, http_router(&config, server))
+                .await
+                .unwrap()
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let request = || RuntimeRequest {
+            code: "pass".into(),
+            files: vec![],
+            timeout_ms: 1000,
+        };
+        let _queued = runtime
+            .submit(request(), Arc::new(AtomicBool::new(false)))
+            .ok()
+            .unwrap();
+        assert!(
+            runtime
+                .submit(request(), Arc::new(AtomicBool::new(false)))
+                .is_err()
+        );
+        for path in ["livez", "readyz"] {
+            check_probe(&client, &base, path, StatusCode::OK).await;
+        }
+        let response = client
+            .post(format!("{base}/mcp"))
+            .header("Host", "10.42.0.17:8000")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Content-Type", "application/json")
+            .body(r#"{"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        drop(worker);
+        for path in ["livez", "readyz"] {
+            check_probe(&client, &base, path, StatusCode::SERVICE_UNAVAILABLE).await;
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_liveness_during_drain_and_bounds_stuck_workers() {
+        let (runtime, worker) = PyodideRuntime::test_pool();
+        let (config, server) = test_server(runtime.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+        let serving_runtime = runtime.clone();
+        let task = tokio::spawn(serve_until_shutdown(
+            listener,
+            http_router(&config, server),
+            serving_runtime,
+            async {
+                signal_rx.await.unwrap();
+                Ok(())
+            },
+            Duration::from_millis(300),
+        ));
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        check_probe(&client, &base, "readyz", StatusCode::OK).await;
+        signal_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.health().is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        check_probe(&client, &base, "readyz", StatusCode::SERVICE_UNAVAILABLE).await;
+        check_probe(&client, &base, "livez", StatusCode::OK).await;
+        assert!(
+            runtime
+                .submit(
+                    RuntimeRequest {
+                        code: "pass".into(),
+                        files: vec![],
+                        timeout_ms: 1000
+                    },
+                    Arc::new(AtomicBool::new(false))
+                )
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // The worker is deliberately still alive when the server deadline expires.
+        assert_eq!(runtime.health().live_workers(), 1);
+        drop(worker);
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_includes_persistent_mcp_streams() {
+        let (runtime, worker) = PyodideRuntime::test_pool();
+        let (config, server) = test_server(runtime.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(serve_until_shutdown(
+            listener,
+            http_router(&config, server),
+            runtime.clone(),
+            async {
+                signal_rx.await.unwrap();
+                Ok(())
+            },
+            Duration::from_millis(300),
+        ));
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let initialized = client.post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"shutdown-test","version":"1"}}}"#)
+            .send().await.unwrap();
+        assert_eq!(initialized.status(), StatusCode::OK);
+        let session = initialized.headers()["mcp-session-id"].clone();
+        let _ = initialized.bytes().await.unwrap();
+        let notification = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("Mcp-Session-Id", session.clone())
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .body(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(notification.status().is_success());
+        let stream = client
+            .get(&url)
+            .header("Accept", "text/event-stream")
+            .header("Mcp-Session-Id", session)
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+        signal_tx.send(()).unwrap();
+        while runtime.health().is_ready() {
+            tokio::task::yield_now().await;
+        }
+        drop(worker);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // Keep the stream open until after the server's shutdown future returns.
+        drop(stream);
+    }
 
     #[tokio::test]
     async fn snippet_search_respects_visibility_and_configured_floor() {
