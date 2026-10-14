@@ -226,6 +226,12 @@ repository.
 
 ### Queue and workers
 
+The HTTP server's Tokio runtime defaults to the detected available parallelism,
+with a minimum of four threads even in single-core containers. Set
+`TOKIO_WORKER_THREADS` to a positive integer to override this count; values below
+four are honored with a startup warning. Invalid values prevent startup. These
+threads are separate from the Python execution workers configured below.
+
 Code execution is handled by a shared FIFO queue and worker pool. Defaults are
 two workers, eight queued requests, and one prewarmed worker. When the queue is
 full, the tool returns a structured overload error. MCP clients that provide a

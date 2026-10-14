@@ -34,6 +34,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 mod runtime;
+mod tokio_workers;
 use code_interpreter_mcp::config::{AppConfig, CodeSnippetsConfig};
 use code_interpreter_mcp::input_limits::{BYTES_PER_KB, InputLimits, MAX_CODE_BYTES, MAX_FILES};
 use runtime::PyodideRuntime;
@@ -578,8 +579,16 @@ fn http_router(config: &AppConfig, server: CodeInterpreterMcpServer) -> Router {
     ))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(tokio_workers::configured_worker_threads())
+        .enable_all()
+        .build()
+        .context("failed to build Tokio runtime")?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let config = AppConfig::load()?;
     let bind_address: SocketAddr = config
         .bind_addr
