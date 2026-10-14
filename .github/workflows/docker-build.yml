@@ -36,7 +36,7 @@ on:
 
 env:
   REGISTRY: registry.eratolabs.com
-  IMAGE_NAME: erato-subscription/code-interpreter-mcp
+  IMAGE_NAME: erato/code-interpreter-mcp
   SHA_TAG: ${{ github.sha }}
   RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
   PUBLISH_LATEST: ${{ github.ref_name == 'main' || github.ref_type == 'tag' }}
