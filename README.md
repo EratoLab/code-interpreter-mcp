@@ -246,7 +246,17 @@ package_cache_dir = ".code-interpreter-mcp-package-cache"
 max_workers = 2
 queue_capacity = 8
 prewarmed_workers = 1
+memory_limit_mb = 512
 ```
+
+`workers.memory_limit_mb` sets the V8 heap budget for each isolate, including
+startup and replacement isolates. It defaults to `512` and uses 1 MB = 1,048,576
+bytes (512 MiB by default). Values must be positive integers whose byte conversion
+fits the platform's address size; invalid values prevent startup. This is a
+per-isolate V8 heap budget, not a total process memory limit. Size the container
+for `workers.max_workers` concurrent heaps plus Pyodide/WebAssembly memory, input
+buffers, caches, and other process overhead. Increasing the container memory
+limit alone does not increase this heap budget.
 
 Prewarmed workers initialize V8, Pyodide, and configured preinstalled packages
 before accepting work. Each execution still gets a fresh isolate. The worker
