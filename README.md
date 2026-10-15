@@ -476,3 +476,90 @@ cargo clippy --all-targets --all-features -- -D warnings
 This project is licensed under the [MIT License](LICENSE).
 
 Third-party dependencies retain their respective licenses.
+
+## Prometheus metrics
+
+Metrics are runtime opt-in; no rebuild is needed. Defaults (also used for omitted
+keys in a partial section):
+
+```toml
+[integrations.prometheus]
+enabled = false
+host = "127.0.0.1"
+port = 3131
+```
+
+To allow scraping from outside a container:
+
+```toml
+[integrations.prometheus]
+enabled = true
+host = "0.0.0.0"
+port = 3131
+```
+
+| TOML key | Default | Environment override |
+| --- | --- | --- |
+| `integrations.prometheus.enabled` | `false` | `CODE_INTERPRETER_MCP_PROMETHEUS_ENABLED` (`true`/`false`) |
+| `integrations.prometheus.host` | `"127.0.0.1"` | `CODE_INTERPRETER_MCP_PROMETHEUS_HOST` |
+| `integrations.prometheus.port` | `3131` | `CODE_INTERPRETER_MCP_PROMETHEUS_PORT` |
+
+Environment overrides apply after TOML merging. When enabled, the host must be
+an IPv4 or IPv6 address (e.g. `::1`), the port must be 1–65535 and must differ from
+`bind_addr`'s port, even when the addresses differ. Invalid settings, bind failures,
+and recorder-installation failures stop startup with an error.
+
+Scrape `http://127.0.0.1:3131/metrics` (or `http://[::1]:3131/metrics` for IPv6).
+The fixed `/metrics` route uses a dedicated listener, independent of MCP Host
+verification and sessions, with no authentication. Expose its port only to intended
+scrapers using your deployment's network controls. The listener starts before Python
+initialization: **metrics availability does not imply readiness**. Continue using
+`/readyz` for readiness and `/livez` for liveness. Disabled metrics install no
+recorder, open no listener, and spawn no reporter. Scrapes read recorded samples
+without acquiring the execution queue lock or running Python/network fetches.
+
+All ten application metric families below have the `code_interpreter_mcp_` prefix.
+Counters and gauges start at zero (queue capacity uses the configured value);
+histograms are registered without synthetic observations. Labels never contain code,
+paths, package names, URLs, session IDs, or error messages.
+
+| Metric suffix | Type | Labels and meaning |
+| --- | --- | --- |
+| `tool_calls_total` | Counter | `tool`, `outcome`: each completed or cancelled handler once |
+| `tool_call_duration_seconds` | Histogram | `tool`, `outcome`: handler entry to completion, including queue/init |
+| `execution_queue_depth` | Gauge | Jobs waiting for a worker |
+| `execution_queue_capacity` | Gauge | Configured maximum waiting jobs |
+| `execution_queue_wait_seconds` | Histogram | `outcome`: `dispatched`, `cancelled`, `shutdown`; enqueue until removal |
+| `workers` | Gauge | `state`: `idle`, `initializing`, `executing`; mutually exclusive live worker states |
+| `python_execution_duration_seconds` | Histogram | `outcome`: `success`, `python_error`, `timeout`, `runtime_failure`; excludes queue/init |
+| `isolate_initialization_duration_seconds` | Histogram | `phase`: `startup`, `on_demand`, `replenishment`; `outcome`: `success`, `runtime_failure` |
+| `execution_rejections_total` | Counter | `reason`: `validation`, `queue_full`, `shutdown` |
+| `worker_unexpected_exits_total` | Counter | Worker exits outside normal shutdown, including panics |
+
+Tool labels are `run_python_code`, `list_code_snippets`, `get_code_snippet`.
+Tool outcomes are `success`, `validation_error`, `overload`, `python_error`,
+`timeout`, `cancelled`, `runtime_failure`. Structured tool results determine
+outcomes, not HTTP status. These metrics cover handlers entered after MCP argument
+parsing; malformed protocol requests rejected before handler entry are not tool calls.
+A missing snippet is a successful lookup returning null. Rejections intentionally
+count a subset of tool calls separately. Cancellation removes queued jobs, but
+already-running Python may finish after its caller has gone; execution observations
+remain separate. Shutdown removes queued jobs and lets active workers drain.
+
+All durations use `Duration::as_secs_f64()` in seconds (25 ms = 0.025).
+Python execution buckets are `0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+1, 2.5, 5, 10, 30, 60, 120`. Queue wait, isolate initialization, and handler
+histograms use those boundaries plus `300, 600`. All include the implicit `+Inf`
+bucket. Buckets control histogram resolution, not recorded duration precision.
+
+The same switch enables a five-second `tokio-metrics` reporter for the **main Tokio
+runtime**, not the dedicated Python worker threads (covered by `workers` and the
+execution/init metrics). Stable-runtime gauges are `tokio_workers_count`,
+`tokio_live_tasks_count`, `tokio_global_queue_depth`, `tokio_total_park_count`,
+`tokio_min_park_count`, `tokio_max_park_count`, `tokio_total_busy_duration_seconds`,
+`tokio_min_busy_duration_seconds`, `tokio_max_busy_duration_seconds`, and
+`tokio_busy_ratio`. Park counts and busy durations describe the last reporting
+interval; busy ratio is the fraction of available worker time spent busy. The
+monitor's durations are converted to fractional seconds rather than using its
+built-in reporter's integer microseconds. No unstable Tokio compiler flags,
+per-metric toggles, or configurable histogram buckets are required.

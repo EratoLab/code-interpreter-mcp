@@ -40,6 +40,70 @@ pub struct AppConfig {
     pub search: SearchConfig,
     #[serde(default)]
     pub input_limits: InputLimitsConfig,
+    #[serde(default)]
+    pub integrations: IntegrationsConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Facet)]
+#[serde(default)]
+pub struct IntegrationsConfig {
+    pub prometheus: PrometheusConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Facet)]
+#[serde(default)]
+pub struct PrometheusConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: i64,
+}
+
+impl Default for PrometheusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".into(),
+            port: 3131,
+        }
+    }
+}
+
+impl PrometheusConfig {
+    pub fn apply_env(&mut self, get: impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(value) = get("CODE_INTERPRETER_MCP_PROMETHEUS_ENABLED") {
+            self.enabled = value
+                .parse()
+                .context("CODE_INTERPRETER_MCP_PROMETHEUS_ENABLED must be true or false")?;
+        }
+        if let Some(value) = get("CODE_INTERPRETER_MCP_PROMETHEUS_HOST") {
+            self.host = value;
+        }
+        if let Some(value) = get("CODE_INTERPRETER_MCP_PROMETHEUS_PORT") {
+            self.port = value
+                .parse()
+                .context("CODE_INTERPRETER_MCP_PROMETHEUS_PORT must be an integer in 1–65535")?;
+        }
+        Ok(())
+    }
+
+    pub fn listen_address(&self, bind_addr: &str) -> Result<Option<std::net::SocketAddr>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let host: std::net::IpAddr = self
+            .host
+            .parse()
+            .context("integrations.prometheus.host must be an IPv4 or IPv6 address")?;
+        let port = u16::try_from(self.port)
+            .ok()
+            .filter(|port| *port != 0)
+            .context("integrations.prometheus.port must be in 1–65535")?;
+        let main: std::net::SocketAddr = bind_addr.parse().context("invalid bind_addr")?;
+        if port == main.port() {
+            bail!("integrations.prometheus.port must differ from the bind_addr port");
+        }
+        Ok(Some(std::net::SocketAddr::new(host, port)))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Facet)]
@@ -174,6 +238,14 @@ impl AppConfig {
                 "CODE_INTERPRETER_MCP_MAX_TOTAL_FILE_KB must be a positive integer in KB (1 KB = 1024 bytes)",
             )?;
         }
+        config
+            .integrations
+            .prometheus
+            .apply_env(|key| env::var(key).ok())?;
+        config
+            .integrations
+            .prometheus
+            .listen_address(&config.bind_addr)?;
         config.input_limits.validate()?;
         Ok(config)
     }
@@ -309,6 +381,74 @@ fn merge(base: &mut toml::Value, incoming: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prometheus_defaults_merge_environment_and_validation() {
+        let mut base: toml::Value =
+            toml::from_str("[integrations.prometheus]\nenabled = true\nhost = '::1'").unwrap();
+        merge(
+            &mut base,
+            toml::from_str("[integrations.prometheus]\nport = 4000").unwrap(),
+        );
+        let config: AppConfig = base.try_into().unwrap();
+        let mut prometheus = config.integrations.prometheus;
+        assert_eq!(
+            prometheus
+                .listen_address("127.0.0.1:8000")
+                .unwrap()
+                .unwrap()
+                .to_string(),
+            "[::1]:4000"
+        );
+        prometheus
+            .apply_env(|key| match key {
+                "CODE_INTERPRETER_MCP_PROMETHEUS_ENABLED" => Some("true".into()),
+                "CODE_INTERPRETER_MCP_PROMETHEUS_HOST" => Some("0.0.0.0".into()),
+                "CODE_INTERPRETER_MCP_PROMETHEUS_PORT" => Some("5000".into()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            prometheus
+                .listen_address("127.0.0.1:8000")
+                .unwrap()
+                .unwrap()
+                .to_string(),
+            "0.0.0.0:5000"
+        );
+        assert!(prometheus.listen_address("[::1]:5000").is_err());
+        for port in [-1, 0, 65536] {
+            prometheus.port = port;
+            assert!(prometheus.listen_address("127.0.0.1:8000").is_err());
+        }
+        prometheus.port = 3131;
+        prometheus.host = "localhost".into();
+        assert!(prometheus.listen_address("127.0.0.1:8000").is_err());
+        prometheus.enabled = false;
+        assert!(prometheus.listen_address("invalid").unwrap().is_none());
+        for (key, value) in [
+            ("CODE_INTERPRETER_MCP_PROMETHEUS_ENABLED", "yes"),
+            ("CODE_INTERPRETER_MCP_PROMETHEUS_PORT", "abc"),
+        ] {
+            assert!(
+                prometheus
+                    .apply_env(|name| (name == key).then(|| value.into()))
+                    .is_err()
+            );
+        }
+        for source in [
+            "",
+            "[integrations]",
+            "[integrations.prometheus]",
+            "[integrations.prometheus]\nenabled = false",
+        ] {
+            let config: AppConfig = toml::from_str(source).unwrap();
+            let p = config.integrations.prometheus;
+            assert!(!p.enabled);
+            assert_eq!(p.host, "127.0.0.1");
+            assert_eq!(p.port, 3131);
+        }
+    }
 
     #[test]
     fn worker_memory_limit_defaults_and_overrides() {

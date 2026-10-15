@@ -14,6 +14,21 @@
   "http_allowed_hosts.[]": {},
   "input_limits.max_file_kb": {},
   "input_limits.max_total_file_kb": {},
+  "integrations.prometheus.enabled": {
+    "default": false,
+    "environment": "CODE_INTERPRETER_MCP_PROMETHEUS_ENABLED",
+    "example": true
+  },
+  "integrations.prometheus.host": {
+    "default": "127.0.0.1",
+    "environment": "CODE_INTERPRETER_MCP_PROMETHEUS_HOST",
+    "example": "0.0.0.0"
+  },
+  "integrations.prometheus.port": {
+    "default": 3131,
+    "environment": "CODE_INTERPRETER_MCP_PROMETHEUS_PORT",
+    "example": 3131
+  },
   "package_cache_dir": {},
   "preinstall_packages.[]": {},
   "runtime_package_installation": {},
