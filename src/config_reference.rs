@@ -8,6 +8,31 @@ use crate::config::AppConfig;
 pub fn generate_config_reference() -> Value {
     let mut entries = BTreeMap::new();
     collect_paths(AppConfig::SHAPE, &mut Vec::new(), &mut entries);
+    for (key, default, environment, example) in [
+        (
+            "enabled",
+            serde_json::json!(false),
+            "CODE_INTERPRETER_MCP_PROMETHEUS_ENABLED",
+            serde_json::json!(true),
+        ),
+        (
+            "host",
+            serde_json::json!("127.0.0.1"),
+            "CODE_INTERPRETER_MCP_PROMETHEUS_HOST",
+            serde_json::json!("0.0.0.0"),
+        ),
+        (
+            "port",
+            serde_json::json!(3131),
+            "CODE_INTERPRETER_MCP_PROMETHEUS_PORT",
+            serde_json::json!(3131),
+        ),
+    ] {
+        entries.insert(
+            format!("integrations.prometheus.{key}"),
+            serde_json::json!({"default": default, "environment": environment, "example": example}),
+        );
+    }
     serde_json::to_value(entries).expect("config reference is serializable")
 }
 

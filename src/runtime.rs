@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -23,6 +23,7 @@ use deno_error::JsErrorBox;
 
 use crate::{RunPythonCodeOutput, RuntimeRequest};
 use code_interpreter_mcp::config::AppConfig;
+use code_interpreter_mcp::metrics as app_metrics;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -65,6 +66,7 @@ struct PackageLayerFile {
 }
 
 struct QueuedRequest {
+    enqueued: Instant,
     id: u64,
     request: RuntimeRequest,
     cancelled: Arc<AtomicBool>,
@@ -100,17 +102,20 @@ impl WorkerHealth {
 }
 
 /// Lives for the entire worker thread, including startup and panic unwinding.
-pub(crate) struct WorkerGuard(Arc<WorkerQueue>);
+pub(crate) struct WorkerGuard(Arc<WorkerQueue>, app_metrics::WorkerState);
 
 impl WorkerGuard {
     fn new(queue: Arc<WorkerQueue>) -> Self {
         queue.health.live_workers.fetch_add(1, Ordering::AcqRel);
-        Self(queue)
+        Self(queue, app_metrics::WorkerState::new())
     }
 }
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
+        if !self.0.stopping.load(Ordering::Acquire) || std::thread::panicking() {
+            metrics::counter!(app_metrics::EXITS).increment(1);
+        }
         let last = self.0.health.live_workers.fetch_sub(1, Ordering::AcqRel) == 1;
         if self.0.state.is_poisoned() || (last && !self.0.stopping.load(Ordering::Acquire)) {
             self.0.health.fatal.store(true, Ordering::Release);
@@ -146,17 +151,26 @@ impl WorkerQueue {
         cancelled: Arc<AtomicBool>,
     ) -> Result<(u64, oneshot::Receiver<RunPythonCodeOutput>), RuntimeRequest> {
         if !self.health.is_ready() {
+            app_metrics::rejection("shutdown");
             return Err(request);
         }
         let Ok(mut state) = self.state.lock() else {
+            app_metrics::rejection("shutdown");
             return Err(request);
         };
-        if state.closed || !self.health.is_ready() || state.requests.len() >= self.capacity {
+        if state.closed || !self.health.is_ready() {
+            app_metrics::rejection("shutdown");
+            return Err(request);
+        }
+        if state.requests.len() >= self.capacity {
+            app_metrics::rejection("queue_full");
             return Err(request);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (response, receiver) = oneshot::channel();
+        metrics::gauge!(app_metrics::DEPTH).increment(1.);
         state.requests.push_back(QueuedRequest {
+            enqueued: Instant::now(),
             id,
             request,
             cancelled,
@@ -170,6 +184,15 @@ impl WorkerQueue {
         let mut state = self.state.lock().expect("worker queue mutex poisoned");
         loop {
             if let Some(request) = state.requests.pop_front() {
+                let cancelled =
+                    request.cancelled.load(Ordering::Acquire) || request.response.is_closed();
+                app_metrics::queue_removed(
+                    request.enqueued,
+                    if cancelled { "cancelled" } else { "dispatched" },
+                );
+                if cancelled {
+                    continue;
+                }
                 return Some(request);
             }
             if state.closed {
@@ -190,10 +213,11 @@ impl WorkerQueue {
     }
 
     fn cancel(&self, id: u64) {
-        let mut state = self.state.lock().expect("worker queue mutex poisoned");
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(index) = state.requests.iter().position(|request| request.id == id)
             && let Some(request) = state.requests.remove(index)
         {
+            app_metrics::queue_removed(request.enqueued, "cancelled");
             request.cancelled.store(true, Ordering::Release);
         }
     }
@@ -205,6 +229,7 @@ impl WorkerQueue {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.closed = true;
         for job in state.requests.drain(..) {
+            app_metrics::queue_removed(job.enqueued, "shutdown");
             let _ = job.response.send(RunPythonCodeOutput::runtime(
                 "Worker pool stopped before queued execution could start",
             ));
@@ -463,7 +488,7 @@ fn worker_thread(
     prewarmed: bool,
     started: tokio::sync::mpsc::Sender<Result<(), String>>,
 ) {
-    let _guard = WorkerGuard::new(queue.clone());
+    let mut guard = WorkerGuard::new(queue.clone());
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -475,7 +500,7 @@ fn worker_thread(
         }
     };
     let mut prepared = if prewarmed {
-        match runtime.block_on(create_initialized_isolate(&config, false)) {
+        match initialize_worker(&runtime, &config, &mut guard.1, "startup") {
             Ok(isolate) => Some(isolate),
             Err(error) => {
                 let _ = started.blocking_send(Err(format!("worker prewarm failed: {error:#}")));
@@ -489,27 +514,31 @@ fn worker_thread(
     drop(started);
 
     loop {
+        guard.1.set("idle");
         let Some(job) = queue.next() else {
             break;
         };
         if job.cancelled.load(Ordering::Acquire) {
             continue;
         }
-        let timeout_ms = job.request.timeout_ms;
         let result = match prepared.take() {
             Some(isolate) => Ok(isolate),
-            None => runtime.block_on(create_initialized_isolate(&config, false)),
+            None => initialize_worker(&runtime, &config, &mut guard.1, "on_demand"),
         }
-        .and_then(|mut isolate| runtime.block_on(execute_python(&mut isolate, &job.request)));
+        .and_then(|mut isolate| {
+            guard.1.set("executing");
+            let start = Instant::now();
+            let result = runtime.block_on(execute_python(&mut isolate, &job.request));
+            let outcome = match &result {
+                Ok(output) => output.outcome(),
+                Err(_) => "runtime_failure",
+            };
+            metrics::histogram!(app_metrics::EXECUTION, "outcome" => outcome)
+                .record(start.elapsed().as_secs_f64());
+            result
+        });
         let output = match result {
             Ok(output) => output,
-            Err(error)
-                if error
-                    .chain()
-                    .any(|cause| cause.to_string().contains("execution terminated")) =>
-            {
-                RunPythonCodeOutput::timed_out(timeout_ms)
-            }
             Err(error) => RunPythonCodeOutput::runtime(format!(
                 "The embedded Deno/Pyodide runtime failed: {error:#}"
             )),
@@ -519,7 +548,7 @@ fn worker_thread(
         // The request isolate is discarded. Build a clean replacement before
         // this worker becomes warm for its next request.
         if prewarmed && !queue.stopping.load(Ordering::Acquire) {
-            match runtime.block_on(create_initialized_isolate(&config, false)) {
+            match initialize_worker(&runtime, &config, &mut guard.1, "replenishment") {
                 Ok(isolate) => prepared = Some(isolate),
                 Err(error) => {
                     eprintln!("Python worker could not replenish its warm isolate: {error:#}")
@@ -527,6 +556,19 @@ fn worker_thread(
             }
         }
     }
+}
+
+fn initialize_worker(
+    runtime: &tokio::runtime::Runtime,
+    config: &RuntimeConfig,
+    state: &mut app_metrics::WorkerState,
+    phase: &'static str,
+) -> Result<JsRuntime> {
+    state.set("initializing");
+    let start = Instant::now();
+    let result = runtime.block_on(create_initialized_isolate(config, false));
+    metrics::histogram!(app_metrics::INIT, "phase" => phase, "outcome" => if result.is_ok() { "success" } else { "runtime_failure" }).record(start.elapsed().as_secs_f64());
+    result
 }
 
 fn create_runtime(config: &RuntimeConfig) -> Result<JsRuntime> {
@@ -646,8 +688,14 @@ async fn execute_python(
     let isolate_handle = runtime.v8_isolate().thread_safe_handle();
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
     let timeout = Duration::from_millis(request.timeout_ms);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let watchdog_timed_out = timed_out.clone();
     let watchdog = std::thread::spawn(move || {
-        if finished_rx.recv_timeout(timeout).is_err() {
+        if matches!(
+            finished_rx.recv_timeout(timeout),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            watchdog_timed_out.store(true, Ordering::Release);
             isolate_handle.terminate_execution();
         }
     });
@@ -668,6 +716,9 @@ async fn execute_python(
         };
     let _ = finished_tx.send(());
     let _ = watchdog.join();
+    if timed_out.load(Ordering::Acquire) {
+        return Ok(RunPythonCodeOutput::timed_out(request.timeout_ms));
+    }
     let value = result?;
     deno_core::scope!(scope, runtime);
     let local = v8::Local::new(scope, value);
@@ -1002,6 +1053,62 @@ mod tests {
             code: "pass".into(),
             files: vec![],
             timeout_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn queue_metrics_cover_dispatch_cancel_overload_shutdown_and_worker_loss() {
+        let recorder = app_metrics::builder().unwrap().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            app_metrics::register(1);
+            let (runtime, worker) = PyodideRuntime::test_pool();
+            let (id, receiver) = runtime
+                .submit(request(), Arc::new(AtomicBool::new(false)))
+                .ok()
+                .unwrap();
+            assert!(
+                runtime
+                    .submit(request(), Arc::new(AtomicBool::new(false)))
+                    .is_err()
+            );
+            runtime.cancel_queued(id);
+            drop(receiver);
+            let (_, receiver) = runtime
+                .submit(request(), Arc::new(AtomicBool::new(false)))
+                .ok()
+                .unwrap();
+            let job = runtime.pool.queue.next().unwrap();
+            drop(job);
+            drop(receiver);
+            let (_, receiver) = runtime
+                .submit(request(), Arc::new(AtomicBool::new(false)))
+                .ok()
+                .unwrap();
+            // Last worker exits unexpectedly; its guard drains the queue.
+            drop(worker);
+            assert!(
+                runtime
+                    .submit(request(), Arc::new(AtomicBool::new(false)))
+                    .is_err()
+            );
+            drop(receiver);
+        });
+        let output = handle.render();
+        for sample in [
+            "execution_queue_depth 0",
+            "workers{state=\"idle\"} 0",
+            "worker_unexpected_exits_total 1",
+            "execution_rejections_total{reason=\"queue_full\"} 1",
+            "execution_rejections_total{reason=\"shutdown\"} 1",
+            "execution_queue_wait_seconds_count{outcome=\"dispatched\"} 1",
+            "execution_queue_wait_seconds_count{outcome=\"cancelled\"} 1",
+            "execution_queue_wait_seconds_count{outcome=\"shutdown\"} 1",
+        ] {
+            assert!(
+                output.contains(&format!("code_interpreter_mcp_{sample}")),
+                "{sample}: {output}"
+            );
         }
     }
 

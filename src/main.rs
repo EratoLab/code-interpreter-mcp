@@ -34,6 +34,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
+use code_interpreter_mcp::metrics as app_metrics;
 mod runtime;
 mod tokio_workers;
 use code_interpreter_mcp::config::{AppConfig, CodeSnippetsConfig};
@@ -121,6 +122,21 @@ pub(crate) struct RunPythonCodeOutput {
 }
 
 impl RunPythonCodeOutput {
+    pub(crate) fn outcome(&self) -> &'static str {
+        if self.success {
+            return "success";
+        }
+        if self.timed_out {
+            return "timeout";
+        }
+        match self.error.as_ref().map(|error| error.kind.as_str()) {
+            Some("validation") => "validation_error",
+            Some("overloaded") => "overload",
+            Some("python") => "python_error",
+            _ => "runtime_failure",
+        }
+    }
+
     fn validation(message: impl Into<String>) -> Self {
         Self::failure("validation", message, None, false)
     }
@@ -207,6 +223,19 @@ pub(crate) struct ValidatedFile {
     pub(crate) content_base64: String,
 }
 
+// Removing a queued request also runs when rmcp drops the handler future.
+struct PendingExecution<'a> {
+    runtime: &'a PyodideRuntime,
+    id: u64,
+    cancelled: Arc<AtomicBool>,
+}
+impl Drop for PendingExecution<'_> {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.runtime.cancel_queued(self.id);
+    }
+}
+
 #[derive(Clone)]
 struct CodeInterpreterMcpServer {
     runtime: PyodideRuntime,
@@ -263,9 +292,12 @@ impl CodeInterpreterMcpServer {
         Parameters(request): Parameters<RunPythonCodeRequest>,
         context: RequestContext<RoleServer>,
     ) -> Json<RunPythonCodeOutput> {
+        let mut call = app_metrics::ToolCall::new("run_python_code");
         let request = match validate_request(request, self.input_limits) {
             Ok(request) => request,
             Err(error) => {
+                app_metrics::rejection("validation");
+                call.finish("validation_error");
                 return Json(RunPythonCodeOutput::validation(error.to_string()));
             }
         };
@@ -274,13 +306,22 @@ impl CodeInterpreterMcpServer {
         let (job_id, mut response) = match self.runtime.submit(request, cancellation.clone()) {
             Ok(submitted) => submitted,
             Err(_) if !self.runtime.health().is_ready() => {
+                call.finish("runtime_failure");
                 return Json(RunPythonCodeOutput::runtime(
                     "Worker pool is not accepting executions",
                 ));
             }
-            Err(_) => return Json(RunPythonCodeOutput::overloaded()),
+            Err(_) => {
+                call.finish("overload");
+                return Json(RunPythonCodeOutput::overloaded());
+            }
         };
 
+        let _pending = PendingExecution {
+            runtime: &self.runtime,
+            id: job_id,
+            cancelled: cancellation.clone(),
+        };
         let mut progress_token = context.meta.get_progress_token();
         let peer = context.peer;
         let request_cancellation = context.ct;
@@ -291,7 +332,9 @@ impl CodeInterpreterMcpServer {
         loop {
             tokio::select! {
                 result = &mut response => {
-                    return Json(result.unwrap_or_else(|_| RunPythonCodeOutput::runtime("Worker ended before returning a result")));
+                    let output = result.unwrap_or_else(|_| RunPythonCodeOutput::runtime("Worker ended before returning a result"));
+                    call.finish(output.outcome());
+                    return Json(output);
                 }
                 _ = request_cancellation.cancelled() => {
                     cancellation.store(true, Ordering::Release);
@@ -324,6 +367,8 @@ impl CodeInterpreterMcpServer {
         &self,
         Parameters(request): Parameters<ListCodeSnippetsRequest>,
     ) -> Json<ListCodeSnippetsOutput> {
+        let mut call = app_metrics::ToolCall::new("list_code_snippets");
+        call.finish("success");
         let snippets = code_interpreter_mcp::snippet_search::search_snippets(
             &self.code_snippets.snippets,
             request.search.as_deref(),
@@ -348,6 +393,8 @@ impl CodeInterpreterMcpServer {
         &self,
         Parameters(request): Parameters<GetCodeSnippetRequest>,
     ) -> Json<GetCodeSnippetOutput> {
+        let mut call = app_metrics::ToolCall::new("get_code_snippet");
+        call.finish("success");
         let snippet =
             self.code_snippets
                 .snippets
@@ -681,6 +728,7 @@ async fn async_main() -> Result<()> {
         .parse()
         .with_context(|| format!("invalid bind_addr: {}", config.bind_addr))?;
 
+    let _metrics = app_metrics::init(&config).await?;
     let server = CodeInterpreterMcpServer::new(&config).await?;
     eprintln!(
         "Input size limits: {} decoded bytes per file, {} decoded bytes total; HTTP request body ceiling: {} bytes",
@@ -748,6 +796,191 @@ mod tests {
                 "unavailable\n"
             }
         );
+    }
+
+    // A child process owns the global recorder; parallel unit tests use local recorders.
+    #[tokio::test]
+    async fn prometheus_http_and_execution_outcomes() {
+        const CHILD: &str = "ERMCP_METRICS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::prometheus_http_and_execution_outcomes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut config: AppConfig =
+            toml::from_str("[workers]\nmax_workers = 1\nprewarmed_workers = 1").unwrap();
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let metrics_address = reservation.local_addr().unwrap();
+        config.integrations.prometheus.enabled = true;
+        config.integrations.prometheus.port = metrics_address.port().into();
+        drop(reservation);
+        let _metrics = app_metrics::init(&config).await.unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let scrape = || {
+            client
+                .get(format!("http://{metrics_address}/metrics"))
+                .header("Host", "independent.example")
+        };
+        // Available before any Python worker exists; no MCP session/Host checks.
+        let idle = scrape().send().await.unwrap();
+        assert_eq!(idle.status(), StatusCode::OK);
+        assert!(
+            idle.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .contains("version=0.0.4")
+        );
+        let idle = idle.text().await.unwrap();
+        for name in [
+            app_metrics::CALLS,
+            app_metrics::CALL_DURATION,
+            app_metrics::DEPTH,
+            app_metrics::CAPACITY,
+            app_metrics::WAIT,
+            app_metrics::WORKERS,
+            app_metrics::EXECUTION,
+            app_metrics::INIT,
+            app_metrics::REJECTIONS,
+            app_metrics::EXITS,
+        ] {
+            assert!(idle.contains(&format!("# TYPE {name} ")), "{name}: {idle}");
+        }
+        assert_eq!(
+            client
+                .get(format!("http://{metrics_address}/mcp"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let server = CodeInterpreterMcpServer::new(&config).await.unwrap();
+        let runtime = server.runtime.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let router = http_router(&config, server);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let post = || {
+            client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream")
+        };
+        let response = post().body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"metrics-test","version":"1"}}}"#).send().await.unwrap();
+        let session = response.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = response.text().await.unwrap();
+        let _ = post()
+            .header("Mcp-Session-Id", &session)
+            .header("MCP-Protocol-Version", "2025-11-25")
+            .body(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .send()
+            .await
+            .unwrap();
+        for (code, timeout, outcome) in [
+            ("40 + 2", 30000, "success"),
+            ("raise ValueError('test')", 30000, "python_error"),
+            ("while True: pass", 10, "timeout"),
+            ("pass", 0, "validation_error"),
+        ] {
+            let request = RunPythonCodeRequest {
+                code: code.into(),
+                files: vec![],
+                timeout_ms: Some(timeout),
+            };
+            let response = post()
+                .header("Mcp-Session-Id", &session)
+                .header("MCP-Protocol-Version", "2025-11-25")
+                .body(serde_json::to_vec(&rpc_request(&request)).unwrap())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = response.text().await.unwrap();
+            let output = scrape().send().await.unwrap().text().await.unwrap();
+            assert!(output.contains(&format!("code_interpreter_mcp_tool_calls_total{{tool=\"run_python_code\",outcome=\"{outcome}\"}} 1")), "{output}");
+        }
+        let output = scrape().send().await.unwrap().text().await.unwrap();
+        for outcome in ["success", "python_error", "timeout"] {
+            assert!(output.contains(&format!("code_interpreter_mcp_python_execution_duration_seconds_count{{outcome=\"{outcome}\"}} 1")), "{output}");
+        }
+        assert!(
+            output.contains(
+                "code_interpreter_mcp_execution_rejections_total{reason=\"validation\"} 1"
+            )
+        );
+        assert!(output.contains("tokio_workers_count"));
+        runtime.shutdown();
+        task.abort();
+        // A second listener must fail recorder installation, not silently serve empty data.
+        let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.integrations.prometheus.port = reservation.local_addr().unwrap().port().into();
+        drop(reservation);
+        assert!(
+            app_metrics::init(&config)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("global recorder")
+        );
+    }
+
+    #[test]
+    fn dropping_pending_execution_removes_queue_and_counts_cancellation_once() {
+        let recorder = app_metrics::builder().unwrap().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            app_metrics::register(1);
+            let (runtime, worker) = PyodideRuntime::test_pool();
+            let call = app_metrics::ToolCall::new("run_python_code");
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let (id, response) = runtime
+                .submit(
+                    RuntimeRequest {
+                        code: "pass".into(),
+                        files: vec![],
+                        timeout_ms: 1000,
+                    },
+                    cancelled.clone(),
+                )
+                .ok()
+                .unwrap();
+            drop(PendingExecution {
+                runtime: &runtime,
+                id,
+                cancelled,
+            });
+            assert!(runtime.queue_position(id).is_none());
+            drop(response);
+            drop(call);
+            runtime.shutdown();
+            drop(worker);
+        });
+        let output = handle.render();
+        assert!(output.contains("code_interpreter_mcp_execution_queue_depth 0"));
+        assert!(output.contains("code_interpreter_mcp_tool_calls_total{tool=\"run_python_code\",outcome=\"cancelled\"} 1"));
     }
 
     #[tokio::test]
