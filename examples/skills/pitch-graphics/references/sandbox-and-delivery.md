@@ -26,7 +26,7 @@ Gilt für `code-interpreter-mcp` (Pyodide 314, Python 3.14, Pillow 12.2, matplot
 | `Only GET requests are supported` | POST/PUT aus der Sandbox | Erwartet; Dateien als Tool-Output ausliefern |
 | `invalid type: string, expected u64` | `timeout_ms` als String gesendet | Parameter weglassen |
 | `The code execution queue is full` | Server ausgelastet | Einmal kurz später erneut versuchen |
-| Timeout | Script zu groß/zu langsam | Nichts zusätzlich laden; bei Charts weniger Datenpunkte |
+| Timeout | Script zu groß/zu langsam | Nichts zusätzlich laden; Betreiber auf Paket-Modus hinweisen (`references/server-setup.md`) |
 
 ## Auslieferung
 

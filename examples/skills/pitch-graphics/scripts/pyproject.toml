@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pitchkit"
-version = "1.0.0"
-description = "Pitch-/Konzept-Grafiken (PNG + HTML) aus einer Inhalts-Spec"
+version = "2.0.0"
+description = "Konzept-Grafiken (PNG + HTML/SVG) aus einer Inhalts-Spec: flow, layers, matrix, hub, cycle, nested"
 requires-python = ">=3.10"
 dependencies = ["pillow>=10"]
 license = "MIT"
