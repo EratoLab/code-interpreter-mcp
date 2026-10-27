@@ -33,17 +33,20 @@ OUT = 2                  # Ausgabe-Skalierung -> 3200x1800
 SS = 2                   # Supersampling-Faktor (Antialiasing für Formen)
 MIN_PX = 18              # kleinste erlaubte Schrift (≈ 11 pt auf Vollbild-Folie)
 MAX_WORDS = 80           # Dichte: darüber Warnung
+SCALE = (44, 40, 36, 30, 26, 24, 22, 20, 18)  # feste Typo-Stufen statt 1-px-Schritten
 
+# edge = neutrale Umrisse (≥ 3:1 zum Hintergrund, WCAG 1.4.11), focus = das eine hervorgehobene Element,
+# rule = rein dekorative Trennlinien. Akzente nur, wenn die Spec eine Bedeutung setzt.
 THEMES = {
     "dark": dict(
         bg="#0F172A", card="#1E293B", inset="#0B1220", ink="#F8FAFC", txt="#E2E8F0",
-        mut="#94A3B8", rule="#334155", line="#64748B", band="#4F46E5", band_ink="#FFFFFF",
-        accents=["#34D399", "#60A5FA", "#FBBF24", "#A78BFA"], on_accent="#0B1220",
+        mut="#94A3B8", rule="#334155", line="#64748B", edge="#64748B", focus="#818CF8",
+        band="#4F46E5", band_ink="#FFFFFF", accents=["#34D399", "#60A5FA", "#FBBF24", "#A78BFA"],
     ),
     "light": dict(
         bg="#F8FAFC", card="#FFFFFF", inset="#F1F5F9", ink="#0F172A", txt="#1E293B",
-        mut="#475569", rule="#E2E8F0", line="#94A3B8", band="#4338CA", band_ink="#FFFFFF",
-        accents=["#047857", "#2563EB", "#B45309", "#7C3AED"], on_accent="#FFFFFF",
+        mut="#475569", rule="#E2E8F0", line="#64748B", edge="#64748B", focus="#4338CA",
+        band="#4338CA", band_ink="#FFFFFF", accents=["#047857", "#2563EB", "#B45309", "#7C3AED"],
     ),
 }
 LIMITS = {"flow": (1, 4), "layers": (2, 5), "matrix": (4, 4), "hub": (3, 6), "cycle": (3, 6), "nested": (2, 4)}
@@ -135,8 +138,12 @@ def _wrap(text, size, style, maxw):
     return lines
 
 
+def _steps(hi, lo):
+    return [s for s in SCALE if lo <= s <= hi] or [hi]
+
+
 def _fit(text, size, min_size, style, maxw, max_lines):
-    for s in range(size, min_size - 1, -1):
+    for s in _steps(size, min_size):
         lines = _wrap(text, s, style, maxw)
         if lines is not None and len(lines) <= max_lines:
             return s, lines
@@ -251,7 +258,8 @@ def _plan(node, w, size, title_max=28, numbered=False, title_w=None, divider=Fal
 def _fit_nodes(nodes, widths, heights, sizes, **kw):
     """Größte gemeinsame Textgröße, bei der alle Knoten passen."""
     errors, over = {}, {}
-    for size in sizes:
+    allowed = set(sizes)
+    for size in [s for s in SCALE if s in allowed]:
         plans = [_plan(n, w, size, **kw) for n, w in zip(nodes, widths)]
         errors = {i: p for i, p in enumerate(plans) if isinstance(p, str)}
         if errors:
@@ -272,8 +280,8 @@ def _draw_node(sc, plan, x, y, w, size, accent, owner, bg, num=None, divider=Fal
         cx, cy = x + 20, y + 20
         sc.ops.append(("circle", cx, cy, 20, accent, None, 0))
         sc.marks.append((("rect", (cx - 20, cy - 20, cx + 20, cy + 20)), owner + ":badge"))
-        sc.ops.append(("ctext", cx, cy, str(num), 20, "b", t["on_accent"]))
-        sc.texts.append(((cx - 8, cy - 12, cx + 8, cy + 12), owner + ":badge", t["on_accent"], accent, 20, "b", str(num)))
+        sc.ops.append(("ctext", cx, cy, str(num), 20, "b", _on(accent)))
+        sc.texts.append(((cx - 8, cy - 12, cx + 8, cy + 12), owner + ":badge", _on(accent), accent, 20, "b", str(num)))
     tsize, tlines = plan["title"]
     if title_w:  # Titel links, Inhalt rechts (layers)
         sc.text(x, y + (plan["h"] - plan["th"]) / 2, tlines, tsize, "b", t["ink"], bg, owner)
@@ -307,12 +315,73 @@ def _draw_node(sc, plan, x, y, w, size, accent, owner, bg, num=None, divider=Fal
             y += 46
 
 
-def _accent(theme, node, i, n=0):
-    """Akzent in fester Reihenfolge; bei mehr Elementen als Akzenten neutral statt zyklisch (Farbe = Bedeutung)."""
-    if "accent" not in node and n > len(theme["accents"]):
-        return theme["mut"]
-    a = node.get("accent", i)
+def _accent(theme, node, focus=False):
+    """Farbe nur mit Bedeutung: explizites accent (0–3 oder Hex), sonst focus fürs hervorgehobene Element, sonst neutral."""
+    a = node.get("accent")
+    if a is None:
+        return theme["focus"] if focus else theme["edge"]
     return theme["accents"][a % len(theme["accents"])] if isinstance(a, int) else a
+
+
+def _on(fill):
+    """Textfarbe mit dem höheren Kontrast auf einer Füllfarbe (Badges)."""
+    return max(("#0B1220", "#FFFFFF"), key=lambda c: _contrast(c, fill))
+
+
+def _color(theme, c):
+    if c == "focus":
+        return theme["focus"]
+    return theme["accents"][c % len(theme["accents"])] if isinstance(c, int) else c
+
+
+def _oklab(hexcolor, sim=None):
+    rgb = [int(hexcolor[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    r, g, b = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in rgb]
+    if sim:  # Machado et al. 2009, Schweregrad 1.0, im linearen RGB
+        r, g, b = [max(0.0, min(1.0, row[0] * r + row[1] * g + row[2] * b)) for row in sim]
+    lms = [0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b,
+           0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b,
+           0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b]
+    l_, m_, s_ = [v ** (1 / 3) for v in lms]
+    return (0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+            1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+            0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_)
+
+
+_CVD = {
+    "Deuteranopie": ((0.367322, 0.860646, -0.227968), (0.280085, 0.672501, 0.047413), (-0.011820, 0.042940, 0.968881)),
+    "Protanopie": ((0.152286, 1.052583, -0.204868), (0.114503, 0.786281, 0.099216), (-0.003882, -0.048116, 1.051998)),
+}
+
+
+def _advice(spec, nodes, theme):
+    """Nicht blockierende Hinweise aus den Designregeln (C4, WCAG 1.4.1, Aussage-Titel)."""
+    out = []
+    title = spec.get("title", "").strip()
+    if len(title.split()) < 4 or title.endswith(":"):
+        out.append("Titel wirkt wie ein Thema – als Aussage formulieren (ganzer Satz, ≥ 4 Wörter)")
+    kind = spec.get("layout", "flow")
+    links = spec.get("links") or spec.get("gates") or []
+    if kind in ("flow", "hub"):
+        expected = len(nodes) - 1 if kind == "flow" else len(nodes)
+        missing = [str(i + 1) for i in range(expected) if i >= len(links) or not links[i].get("label")]
+        if missing:
+            out.append(f"Verbindung(en) {', '.join(missing)} ohne Verb-Label")
+    used = {}
+    for nd in nodes:
+        if nd.get("accent") is not None:
+            used[_color(theme, nd["accent"])] = nd.get("title", "")
+    if len(used) >= 2 and not spec.get("legend"):
+        out.append("≥ 2 Bedeutungsfarben ohne legend – Bedeutung erklären")
+    cols = list(used)
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            for name, sim in _CVD.items():
+                a, b = _oklab(cols[i], sim), _oklab(cols[j], sim)
+                if math.dist(a, b) * 100 < 8:
+                    out.append(f"„{used[cols[i]]}“ und „{used[cols[j]]}“ sind bei {name} kaum unterscheidbar – Bedeutung per Text/legend tragen")
+                    break
+    return out
 
 
 def _edge(rect, toward, gap=6):
@@ -346,7 +415,7 @@ def _flow(sc, spec, nodes, top, bottom):
     shift = (card_h - fitted) / 2
     y0, y1 = top + shift, top + shift + fitted
     for i, x in enumerate(xs):
-        a = _accent(t, nodes[i], i)
+        a = _accent(t, nodes[i], i == spec.get("highlight"))
         owner = f"n{i + 1}"
         sc.rrect((x, y0, x + cw, y1), 22, t["card"], a, 3, owner)
         sc.boxes[owner] = (x + 8, y0 + 8, x + cw - 8, y1 - 8)
@@ -412,9 +481,9 @@ def _layers(sc, spec, nodes, top, bottom):
     y = top + (bottom - top - total) / 2
     y_first = y
     for i, node in enumerate(nodes):
-        a = _accent(t, node, i, n)
+        a = _accent(t, node, i == spec.get("highlight"))
         owner = f"n{i + 1}"
-        sc.rrect((M, y, x1, y + row_h), 16, t["card"], t["rule"], 2, owner)
+        sc.rrect((M, y, x1, y + row_h), 16, t["card"], t["edge"], 2, owner)
         sc.ops.append(("rrect", (M, y, M + 10, y + row_h), 5, a, None, 0))
         sc.boxes[owner] = (M + 12, y + 4, x1 - 6, y + row_h - 4)
         bx = M + 10 + pad + tw + pad
@@ -451,8 +520,8 @@ def _matrix(sc, spec, nodes, top, bottom):
         x = q0x + (i % 2) * (qw + g)
         y = q0y + (i // 2) * (qh + g)
         owner = f"n{i + 1}"
-        a = _accent(t, nodes[i], 1)
-        sc.rrect((x, y, x + qw, y + qh), 18, t["card"], a if i == hi else t["rule"], 3 if i == hi else 2, owner)
+        a = _accent(t, nodes[i], i == hi)
+        sc.rrect((x, y, x + qw, y + qh), 18, t["card"], a, 2 if a == t["edge"] else 3, owner)
         sc.boxes[owner] = (x + 8, y + 8, x + qw - 8, y + qh - 8)
         _draw_node(sc, plans[i], x + pad, y + off, qw - 2 * pad, size, a, owner, t["card"])
     sc.arrow((axis_x, axis_y), (axis_x, top), t["line"], "axis:y", width=3)
@@ -521,7 +590,7 @@ def _hub(sc, spec, nodes, top, bottom):
     rx, ry = (W - 2 * M - sw) / 2, (bottom - top - sh) / 2
     errors = []
     for i, (dx, dy) in enumerate((ux * rx, uy * ry) for ux, uy in _HUB_POS[n]):
-        a = _accent(t, nodes[i], i, n)
+        a = _accent(t, nodes[i], i == spec.get("highlight"))
         owner = f"n{i + 1}"
         x, y = cx + dx - sw / 2, cy + dy - sh / 2
         rect = (x, y, x + sw, y + sh)
@@ -531,7 +600,7 @@ def _hub(sc, spec, nodes, top, bottom):
         lk = links[i] if links else {}
         p = _edge(crect, (cx + dx, cy + dy))
         q = _edge(rect, (cx, cy))
-        d = lk.get("dir", "none")
+        d = lk.get("dir", "out")
         sc.arrow(p, q, t["line"], f"link{i + 1}", width=3, start=d in ("in", "both"), end=d in ("out", "both"))
         if lk.get("label"):
             err = sc.pill((p[0] + q[0]) / 2, (p[1] + q[1]) / 2, lk["label"], f"link{i + 1}:pill")
@@ -555,7 +624,7 @@ def _cycle(sc, spec, nodes, top, bottom):
     pos = [(cx + dx, cy + dy) for dx, dy in _ring(n, rx, ry, -90)]
     rects = [(px - sw / 2, py - sh / 2, px + sw / 2, py + sh / 2) for px, py in pos]
     for i, rect in enumerate(rects):
-        a = _accent(t, nodes[i], i, n)
+        a = _accent(t, nodes[i], i == spec.get("highlight"))
         owner = f"n{i + 1}"
         sc.rrect(rect, 18, t["card"], a, 3, owner)
         sc.boxes[owner] = (rect[0] + 8, rect[1] + 8, rect[2] - 8, rect[3] - 8)
@@ -606,7 +675,7 @@ def _nested(sc, spec, nodes, top, bottom):
     y0 = top + (bottom - top - total) / 2
     rect = (M, y0, W - M, y0 + total)
     for i, node in enumerate(nodes):
-        a = _accent(t, node, i)
+        a = _accent(t, node, i == spec.get("highlight"))
         owner = f"n{i + 1}"
         fill = _mix(t["bg"], t["card"], 0.35 + 0.65 * i / (n - 1))
         sc.ops.append(("rrect", rect, 26, fill, a, 3))
@@ -657,6 +726,17 @@ def _layout(spec, theme):
         if not fit:
             raise LayoutError("Footer zu lang: auf ≤ 130 Zeichen kürzen.")
         sc.text(M, footer_top, fit[1], 18, "r", t["mut"], t["bg"], "page")
+    if spec.get("legend"):  # Farbbedeutungen rechts in der Fußzeile
+        entries = [(_color(t, c), str(label)) for c, label in spec["legend"]]
+        widths = [24 + _len(label, 18) for _, label in entries]
+        x = W - M - sum(widths) - 28 * (len(entries) - 1)
+        asc, desc = _metrics(18)
+        for (color, label), w in zip(entries, widths):
+            cy = footer_top + (asc + desc) / 2
+            sc.ops.append(("circle", x + 7, cy, 7, color, None, 0))
+            sc.marks.append((("rect", (x, cy - 7, x + 14, cy + 7)), "legend:dot"))
+            sc.text(x + 24, footer_top, [label], 18, "r", t["mut"], t["bg"], "page")
+            x += w + 28
     top, bottom = y + 40, footer_top - 28
     if bottom - top < 420:
         raise LayoutError("Zu wenig Höhe: Titel/Subtitle kürzen.")
@@ -705,10 +785,9 @@ def _lint(sc, spec):
     for bb, owner, fg, bg, size, style, text in sc.texts:
         if size < MIN_PX:
             problems.append(f"Schrift {size}px < {MIN_PX}px: „{text}“")
-        need = 3.0 if (size >= 24 or (style == "b" and size >= 19)) else 4.5
-        cr = _contrast(fg, bg)
-        if cr < need:
-            problems.append(f"Kontrast {cr:.2f}:1 < {need}:1: „{text}“")
+        cr = _contrast(fg, bg)  # 4,5:1 für jede Schrift – verkleinert ist „großer Text“ nicht mehr groß
+        if cr < 4.5:
+            problems.append(f"Kontrast {cr:.2f}:1 < 4.5:1: „{text}“")
         if bb[0] < M - 1 or bb[2] > W - M + 1 or bb[1] < 16 or bb[3] > H - 16:
             problems.append(f"außerhalb Satzspiegel: „{text}“")
         box = sc.boxes.get(owner.split(":")[0]) if owner.endswith(":chip") else sc.boxes.get(owner)
@@ -726,6 +805,12 @@ def _lint(sc, spec):
             hit = _hit(mark[1], bb) if mark[0] == "rect" else _seg_hits(mark[1], mark[2], bb)
             if hit:
                 problems.append(f"„{text}“ berührt {mowner}")
+    for op in sc.ops:  # WCAG 1.4.11: Linien, Pfeile, Umrisse ≥ 3:1 zum Hintergrund (Trennlinien `rule` sind Dekor)
+        stroke = {"line": op[2] if op[0] == "line" else None, "poly": op[2] if op[0] == "poly" else None,
+                  "dash": op[4] if op[0] == "dash" else None, "rrect": op[4] if op[0] == "rrect" else None,
+                  "circle": op[5] if op[0] == "circle" else None}.get(op[0])
+        if stroke and stroke != sc.t["rule"] and _contrast(stroke, sc.t["bg"]) < 3:
+            problems.append(f"Linie/Umriss {stroke}: {_contrast(stroke, sc.t['bg']):.2f}:1 < 3:1 zum Hintergrund")
     rects = [(m[1], o) for m, o in sc.marks if m[0] == "rect" and (o == "center" or (o.startswith("n") and ":" not in o))]
     if spec.get("layout", "flow") != "nested":
         for i in range(len(rects)):
@@ -850,20 +935,18 @@ def _outline(spec, nodes):
 
 
 def _alt(spec, nodes):
+    """Kurzer Alt-Text (≤ 2 Sätze); die Langbeschreibung steht sichtbar im HTML."""
     kind = spec.get("layout", "flow")
     names = [nd.get("title", "") for nd in nodes]
-    links = spec.get("links") or spec.get("gates") or []
     lead = {
         "flow": "Abfolge: " + " → ".join(names),
         "layers": "Schichten von oben nach unten: " + ", ".join(names),
         "matrix": "Vier Felder (oben links, oben rechts, unten links, unten rechts): " + ", ".join(names),
-        "hub": f"Im Zentrum {(spec.get('center') or {}).get('title', '')}, verbunden mit: " + ", ".join(
-            f"{x} ({links[i]['label']})" if i < len(links) and links[i].get("label") else x for i, x in enumerate(names)),
+        "hub": f"Im Zentrum {(spec.get('center') or {}).get('title', '')}, verbunden mit " + ", ".join(names),
         "cycle": "Kreislauf: " + " → ".join(names) + " → zurück zu " + (names[0] if names else ""),
         "nested": "Von außen nach innen: " + " ⊃ ".join(names),
     }[kind]
-    parts = [spec.get("title", ""), spec.get("subtitle", ""), lead]
-    return ". ".join(p.strip(". ") for p in parts if p) + "."
+    return ". ".join(p.strip(". ") for p in (spec.get("title", ""), lead) if p) + "."
 
 
 def _html(spec, nodes, sc, alt):
@@ -871,14 +954,14 @@ def _html(spec, nodes, sc, alt):
     t = sc.t
     css = (f"body{{margin:0;background:{t['bg']};color:{t['txt']};font:16px/1.5 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}}"
            "figure{margin:0 auto;max-width:1600px;padding:clamp(8px,2vw,24px)}svg{display:block;width:100%;height:auto}"
-           ".outline{max-width:70ch;margin:0 auto;padding:0 16px 24px}"
-           f".outline h2{{font-size:1.05rem;color:{t['ink']};margin:.8rem 0 .2rem}}"
-           "@media (min-width:760px){.outline{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}}")
+           f"figcaption{{max-width:70ch;padding:.6rem 0}}summary{{color:{t['mut']};cursor:pointer}}"
+           f"figcaption h2{{font-size:1.05rem;color:{t['ink']};margin:.8rem 0 .2rem}}")
     sub = f'<p>{e(spec["subtitle"])}</p>' if spec.get("subtitle") else ""
+    # WAI „complex images“: kurzer Alt-Text am Bild, Langbeschreibung über sichtbaren Schalter in figcaption
     return (f'<!doctype html><html lang="{e(spec.get("lang", "de"))}"><head><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1"><title>{e(spec.get("title", ""))}</title>'
-            f'<style>{css}</style></head><body><figure>{_svg(sc, alt)}</figure>'
-            f'<section class="outline" aria-label="Inhalt als Text">{sub}{_outline(spec, nodes)}</section></body></html>')
+            f'<style>{css}</style></head><body><figure>{_svg(sc, alt)}<figcaption><details>'
+            f'<summary>Beschreibung als Text</summary>{sub}{_outline(spec, nodes)}</details></figcaption></figure></body></html>')
 
 
 def render(spec, name="grafik", outdir="."):
@@ -904,6 +987,8 @@ def render(spec, name="grafik", outdir="."):
     ignored = sorted({k for nd in nodes for k in nd} - {"title", "text", "points", "items", "accent", "bullets"})
     if ignored:
         warn += f" · WARNUNG: ignorierte Felder {', '.join(ignored)}"
+    for hint in _advice(spec, nodes, sc.t):
+        warn += f" · HINWEIS: {hint}"
     report = (f"PRÜFUNG OK · {spec.get('layout', 'flow')} · {len(nodes)} Elemente · {words} Wörter · "
               f"kleinste Schrift {min_px}px · min. Kontrast {min_cr:.1f}:1 · 0 Kollisionen · "
               f"{png} {im.size[0]}×{im.size[1]} {os.path.getsize(png) // 1024} KB · {page} {os.path.getsize(page) // 1024} KB{warn}")

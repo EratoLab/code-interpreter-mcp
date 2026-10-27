@@ -38,10 +38,10 @@ Snippet/Skript-Modus brauchen `pillow` + `matplotlib` vorinstalliert **oder** �
 
 - **Titel = Aussage, nicht Thema** (≤ 60 Zeichen): „Je sensibler die Daten, desto enger der Kreis“ statt „Datenzonen“. Subtitle optional (≤ 120 Zeichen).
 - **Element:** `title` 1–3 Wörter · `text` ein kurzer Satz (≤ 8 Wörter) · `items` als Chips (1–2 Wörter: Systeme, Beispiele) · `points` (≤ 3 kurze Punkte) nur wo eine Karte wirklich Liste ist.
-- **Verbindungen mit Verb beschriften** („liest“, „gibt frei“, „meldet“). Ein unbeschrifteter Pfeil sagt nur „irgendwie verbunden“.
+- **Jede Verbindung mit Verb beschriften** („liest“, „gibt frei“, „meldet“) und mit einer Richtung (Hub-Pfeile zeigen standardmäßig nach außen, `dir` ändert das). Ein unbeschrifteter Pfeil sagt nur „irgendwie verbunden“.
 - Ziel ≤ 60 Wörter (Warnung ab 80). Erklärungen gehören in deinen Antworttext und den Alt-Text, nicht ins Bild.
-- **Farbe nur mit Bedeutung:** Akzente laufen in fester Reihenfolge (0 grün = sicher/lokal, 1 blau = intern, 2 gelb = extern/wachsam, 3 violett = Premium). Bedeutung explizit per `accent` setzen; ab 5 Elementen ohne `accent` wird neutral gezeichnet. Die Bedeutung steht immer auch im Text.
-- `footer`: Quelle · Stand (Monat/Jahr). `theme`: `dark` | `light`. `lang`: Sprache des Nutzers.
+- **Farbe nur mit Bedeutung.** Standard ist neutral. `"highlight": i` hebt das *eine* Element hervor, um das es geht. Bedeutungsfarben per `accent` (0 grün = sicher/lokal, 1 blau = intern, 2 gelb = extern/wachsam, 3 violett = Premium) nur, wenn Farbe etwas codiert – dann `"legend": [[0, "streng vertraulich"], [2, "freigegeben"]]` setzen. Blau und Violett nie als einzige Unterscheidung (bei Rot-Grün-Schwäche identisch).
+- `theme`: `light` für Notion, Dokumente und helle Räume; `dark` nur passend zu einem dunklen Deck. `footer`: Quelle · Stand (Monat/Jahr). `lang`: Sprache des Nutzers.
 - Fehlende Angaben aus dem Kontext ableiten statt nachfragen; Annahmen im Bericht nennen.
 
 ## 4. Ein Aufruf: rendern + prüfen
@@ -76,20 +76,22 @@ Weitere Spec-Formen: `matrix` braucht `"axes": {"x": {"title": "Aufwand", "low":
 
 `render()` schreibt bei Problemen **keine** Dateien, sondern wirft `LayoutError` mit konkreter Anweisung, z. B. „Element 2 („Intern“): 37 px zu hoch (≈ 1 Zeile kürzen)“, „Übergang 1: Label „Datenschutzprüfung“ zu lang“, „hub: 7 Elemente – erlaubt sind 3–6“. Kürzen, zusammenfassen oder auf zwei Grafiken aufteilen. Andere Fehler: `references/sandbox-and-delivery.md`.
 
-## 6. Ansehen, wenn du das Bild sehen kannst
+`HINWEIS:`-Zeilen im Prüfbericht (Titel wirkt wie Thema, Verbindung ohne Verb, Farben ohne `legend`, Farbpaar bei Farbsehschwäche ununterscheidbar) blockieren nicht – befolge sie, wenn es ohne Inhaltsverlust geht.
 
-Die Prüfung (Kollisionen, Containment, Kontrast ≥ 4,5:1, Schrift ≥ 18 px, Dichte) ist das Minimum. Wenn dein Client dir das PNG zeigt, prüfe streng und rendere bei einem „Nein“ einmal neu:
-1. Versteht jemand ohne Vorwissen die **Beziehung** (wer liest von wem, was liegt worin, was folgt worauf) allein aus Titel + Bild?
-2. Ist jede Verbindung beschriftet und zeigt in die richtige Richtung?
-3. Trägt jede Farbe eine Bedeutung – oder ist sie Dekoration?
-4. Ist ein Element deutlich voller als die anderen? → angleichen oder Text in den Antworttext verschieben.
+## 6. Verständnis prüfen, wenn du das Bild sehen kannst
+
+Die automatische Prüfung (Kollisionen, Containment, Text ≥ 4,5:1, Linien/Umrisse ≥ 3:1, Schrift ≥ 18 px, Dichte) ist das Tor – sie ist verlässlicher als dein Blick aufs Bild, also nie „nach Augenschein“ überstimmen. Wenn dein Client dir das PNG zeigt, mach danach einen Verständnistest und rendere bei einem Fehlschlag einmal neu:
+1. Leite aus der SPEC drei Fragen ab („Was folgt auf X?“, „Wer liest von Y?“, „Was liegt innerhalb von Z?“) und beantworte sie **nur aus dem Bild**. Falsch oder unsicher → Beziehung deutlicher machen (Label, Richtung, Layout).
+2. Squint-Test: Ist das wichtigste Element auch das auffälligste? Sonst `highlight` setzen oder Text kürzen.
 
 ## 7. Ausliefern
 
 - **PNG** (16:9, 3200×1800, ~65–100 KB): für Slides und Notion (dort auf volle Breite).
-- **HTML**: dasselbe Bild als Vektor (Inline-SVG, skaliert verlustfrei) plus Textfassung für Screenreader und schmale Bildschirme.
-- Im Antworttext: die `PRÜFUNG`-Zeile, Annahmen und den **Alt-Text** (`ALT:`-Zeile).
+- **HTML**: dasselbe Bild als Vektor (Inline-SVG) plus aufklappbare Langbeschreibung als Text (Screenreader, schmale Bildschirme).
+- Im Antworttext: die `PRÜFUNG`-Zeile, Annahmen und den **Alt-Text** (`ALT:`, ≤ 2 Sätze – für Folie/Notion).
 - Nichts nach Notion o. Ä. schreiben ohne ausdrücklichen Wunsch → `references/sandbox-and-delivery.md`.
+
+Herkunft der Regeln (WCAG, C4, Mayer, NN/g, Apple HIG) und offene Designentscheidungen: `references/design-principles.md`.
 
 ## Nie
 
