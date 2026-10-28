@@ -1,18 +1,18 @@
 # Server-Setup für schnelle Grafiken (Betreiber)
 
-Der Skill funktioniert ohne Server-Anpassung (Skript-Modus), aber dann muss das Modell bei **jedem** Aufruf ~48 KB Kit-Code (≈ 13 000 Output-Tokens) mitsenden. Mit vorinstalliertem Paket sendet es nur die Spec (≈ 1 KB).
+Der Skill funktioniert ohne Server-Anpassung (Skript-Modus), aber dann muss das Modell bei **jedem** Aufruf ~50 KB Kit-Code (≈ 14 000 Output-Tokens) mitsenden. Mit vorinstalliertem Paket sendet es nur die Spec (≈ 1 KB).
 
 | Modus | Code pro Aufruf | Netz zur Laufzeit nötig | Einrichtung |
 |---|---|---|---|
 | Paket | ~1 KB (nur `SPEC`) | nein | Wheel bauen + hosten, `preinstall_packages` |
-| Snippet | ~49 KB | nein, wenn pillow/matplotlib vorinstalliert | `code_snippets` in der TOML |
-| Skript | ~49 KB | ja, wenn pillow/matplotlib nicht vorinstalliert | keine |
+| Snippet | ~51 KB | nein, wenn pillow/matplotlib vorinstalliert | `code_snippets` in der TOML |
+| Skript | ~51 KB | ja, wenn pillow/matplotlib nicht vorinstalliert | keine |
 
 ## Paket-Modus (empfohlen)
 
 ```bash
 pip wheel --no-deps -w dist examples/skills/pitch-graphics/scripts
-# -> dist/pitchkit-2.0.0-py3-none-any.whl (~17 KB); auf einem Host aus allowed_hosts ablegen
+# -> dist/pitchkit-2.0.0-py3-none-any.whl (~20 KB, enthält pitchkit + brand_colors); auf einem Host aus allowed_hosts ablegen
 ```
 
 ```toml

@@ -11,4 +11,4 @@ dependencies = ["pillow>=10"]
 license = "MIT"
 
 [tool.setuptools]
-py-modules = ["pitchkit"]
+py-modules = ["pitchkit", "brand_colors"]

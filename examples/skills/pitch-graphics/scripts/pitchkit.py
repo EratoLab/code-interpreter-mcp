@@ -49,6 +49,13 @@ THEMES = {
         band="#4338CA", band_ink="#FFFFFF", accents=["#047857", "#2563EB", "#B45309", "#7C3AED"],
     ),
 }
+# Formensprache: ein Basisradius r0 steuert alle Radien (innen = außen − Abstand, nie < r_min),
+# zwei Strichstärken (stroke = neutral, strong = Akzent/Verbindung). Inhalt und Stil bleiben getrennt.
+STYLES = {
+    "classic": dict(r0=4, r_min=0, stroke=1.5, strong=2.5, pill="r0", badge_r=3, concentric=False),
+    "modern": dict(r0=12, r_min=4, stroke=2, strong=3, pill="min", badge_r=20, concentric=True),
+    "friendly": dict(r0=24, r_min=8, stroke=2.5, strong=4, pill="full", badge_r=20, concentric=True),
+}
 LIMITS = {"flow": (1, 4), "layers": (2, 5), "matrix": (4, 4), "hub": (3, 6), "cycle": (3, 6), "nested": (2, 4)}
 
 
@@ -182,7 +189,9 @@ class _Scene:
         if owner:
             self.marks.append((("rect", rect), owner))
 
-    def arrow(self, p, q, color, owner, width=4, start=False, end=True, head=16):
+    def arrow(self, p, q, color, owner, width=None, start=False, end=True, head=None):
+        width = width or self.t["strong"]
+        head = head or 5.5 * width
         ang = math.atan2(q[1] - p[1], q[0] - p[0])
         ux, uy = math.cos(ang), math.sin(ang)
         a = (p[0] + ux * head * 0.8, p[1] + uy * head * 0.8) if start else p
@@ -203,7 +212,7 @@ class _Scene:
         w = max(_len(x, size) for x in lines) + 28
         h = _block_h(len(lines), size) + 14
         rect = (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
-        self.rrect(rect, min(h / 2, 16), self.t["bg"], self.t["line"], 2, owner)
+        self.rrect(rect, _pill_r(self.t, h), self.t["bg"], self.t["line"], self.t["stroke"], owner)
         self.text(rect[0] + 14, rect[1] + 7, lines, size, "r", self.t["txt"], self.t["bg"], owner, "center", w - 28)
         return None
 
@@ -278,7 +287,7 @@ def _draw_node(sc, plan, x, y, w, size, accent, owner, bg, num=None, divider=Fal
     t = sc.t
     if num is not None:
         cx, cy = x + 20, y + 20
-        sc.ops.append(("circle", cx, cy, 20, accent, None, 0))
+        sc.ops.append(("rrect", (cx - 20, cy - 20, cx + 20, cy + 20), t["badge_r"], accent, None, 0))
         sc.marks.append((("rect", (cx - 20, cy - 20, cx + 20, cy + 20)), owner + ":badge"))
         sc.ops.append(("ctext", cx, cy, str(num), 20, "b", _on(accent)))
         sc.texts.append(((cx - 8, cy - 12, cx + 8, cy + 12), owner + ":badge", _on(accent), accent, 20, "b", str(num)))
@@ -292,7 +301,7 @@ def _draw_node(sc, plan, x, y, w, size, accent, owner, bg, num=None, divider=Fal
         sc.text(tx, y + (plan["head"] - plan["th"]) / 2, tlines, tsize, "b", t["ink"], bg, owner)
         y += plan["head"]
         if divider and plan["body"]:
-            sc.ops.append(("line", [(x, y + 12), (x + w, y + 12)], t["rule"], 2))
+            sc.ops.append(("line", [(x, y + 12), (x + w, y + 12)], t["rule"], t["stroke"]))
         y += plan["gap"]
     if plan["text"]:
         y = sc.text(x, y, plan["text"], size, "r", t["txt"], bg, owner)
@@ -309,7 +318,7 @@ def _draw_node(sc, plan, x, y, w, size, accent, owner, bg, num=None, divider=Fal
         for row in plan["rows"]:
             cx = x
             for item, cw in row:
-                sc.rrect((cx, y, cx + cw, y + 36), 18, t["inset"], None, 0, owner + ":chip")
+                sc.rrect((cx, y, cx + cw, y + 36), _pill_r(t, 36), t["inset"], None, 0, owner + ":chip")
                 sc.text(cx + 14, y + (36 - _block_h(1, MIN_PX)) / 2, [item], MIN_PX, "r", t["txt"], t["inset"], owner + ":chip")
                 cx += cw + 10
             y += 46
@@ -321,6 +330,15 @@ def _accent(theme, node, focus=False):
     if a is None:
         return theme["focus"] if focus else theme["edge"]
     return theme["accents"][a % len(theme["accents"])] if isinstance(a, int) else a
+
+
+def _pill_r(t, h):
+    return {"r0": t["r0"], "min": min(h / 2, t["r0"]), "full": h / 2}[t["pill"]]
+
+
+def _w(t, color):
+    """Neutrale Umrisse in stroke, Akzent/Fokus in strong."""
+    return t["stroke"] if color == t["edge"] else t["strong"]
 
 
 def _on(fill):
@@ -417,7 +435,7 @@ def _flow(sc, spec, nodes, top, bottom):
     for i, x in enumerate(xs):
         a = _accent(t, nodes[i], i == spec.get("highlight"))
         owner = f"n{i + 1}"
-        sc.rrect((x, y0, x + cw, y1), 22, t["card"], a, 3, owner)
+        sc.rrect((x, y0, x + cw, y1), t["r0"], t["card"], a, _w(t, a), owner)
         sc.boxes[owner] = (x + 8, y0 + 8, x + cw - 8, y1 - 8)
         _draw_node(sc, plans[i], x + pad, y0 + pad, cw - 2 * pad, size, a, owner, t["card"], i + 1 if numbered else None, True)
     mid = (y0 + y1) / 2
@@ -430,7 +448,7 @@ def _flow(sc, spec, nodes, top, bottom):
         sc.arrow((gx0 + 12, mid), (gx1 - 10, mid), t["line"], owner + ":arrow")
         lock = g.get("lock", False)
         if lock:
-            sc.ops.append(("circle", gcx, mid, 24, t["bg"], t["line"], 3))
+            sc.ops.append(("circle", gcx, mid, 24, t["bg"], t["line"], t["strong"]))
             sc.ops.append(("lock", gcx, mid, t["mut"]))
             sc.marks.append((("rect", (gcx - 24, mid - 24, gcx + 24, mid + 24)), owner + ":lock"))
         off = 36 if lock else 24
@@ -450,7 +468,7 @@ def _flow(sc, spec, nodes, top, bottom):
     if band:
         b0 = y1 + 40
         b1 = b0 + 112
-        sc.rrect((M, b0, W - M, b1), 18, t["band"], None, 0, "band")
+        sc.rrect((M, b0, W - M, b1), t["r0"], t["band"], None, 0, "band")
         sc.boxes["band"] = (M + 8, b0 + 6, W - M - 8, b1 - 6)
         for x in xs:
             sc.ops.append(("dash", x + cw / 2, y1 + 6, b0 - 6, t["line"]))
@@ -483,8 +501,8 @@ def _layers(sc, spec, nodes, top, bottom):
     for i, node in enumerate(nodes):
         a = _accent(t, node, i == spec.get("highlight"))
         owner = f"n{i + 1}"
-        sc.rrect((M, y, x1, y + row_h), 16, t["card"], t["edge"], 2, owner)
-        sc.ops.append(("rrect", (M, y, M + 10, y + row_h), 5, a, None, 0))
+        sc.rrect((M, y, x1, y + row_h), t["r0"], t["card"], t["edge"], t["stroke"], owner)
+        sc.ops.append(("rrect", (M, y, M + 10, y + row_h), min(5, t["r0"]), a, None, 0))
         sc.boxes[owner] = (M + 12, y + 4, x1 - 6, y + row_h - 4)
         bx = M + 10 + pad + tw + pad
         _draw_node(sc, plans[i], M + 10 + pad, y + (row_h - plans[i]["h"]) / 2, x1 - pad - (M + 10 + pad), size, a, owner,
@@ -492,7 +510,7 @@ def _layers(sc, spec, nodes, top, bottom):
         y += row_h + gapy
     if side:
         sx0, sx1, sy0, sy1 = x1 + 24, W - M, y_first, y - gapy
-        sc.rrect((sx0, sy0, sx1, sy1), 16, t["band"], None, 0, "side")
+        sc.rrect((sx0, sy0, sx1, sy1), t["r0"], t["band"], None, 0, "side")
         sc.boxes["side"] = (sx0 + 8, sy0 + 8, sx1 - 8, sy1 - 8)
         st = _fit(side.get("title", ""), 24, 20, "b", sx1 - sx0 - 40, 3)
         sx = _fit(side.get("text", ""), 19, MIN_PX, "r", sx1 - sx0 - 40, 8) if side.get("text") else (19, [])
@@ -521,11 +539,11 @@ def _matrix(sc, spec, nodes, top, bottom):
         y = q0y + (i // 2) * (qh + g)
         owner = f"n{i + 1}"
         a = _accent(t, nodes[i], i == hi)
-        sc.rrect((x, y, x + qw, y + qh), 18, t["card"], a, 2 if a == t["edge"] else 3, owner)
+        sc.rrect((x, y, x + qw, y + qh), t["r0"], t["card"], a, _w(t, a), owner)
         sc.boxes[owner] = (x + 8, y + 8, x + qw - 8, y + qh - 8)
         _draw_node(sc, plans[i], x + pad, y + off, qw - 2 * pad, size, a, owner, t["card"])
-    sc.arrow((axis_x, axis_y), (axis_x, top), t["line"], "axis:y", width=3)
-    sc.arrow((axis_x, axis_y), (W - M, axis_y), t["line"], "axis:x", width=3)
+    sc.arrow((axis_x, axis_y), (axis_x, top), t["line"], "axis:y")
+    sc.arrow((axis_x, axis_y), (W - M, axis_y), t["line"], "axis:x")
     errors = []
 
     def label(text, x, y, align, width, style="r", lines=2):
@@ -580,7 +598,7 @@ def _hub(sc, spec, nodes, top, bottom):
     ch = cplan[1][0]["h"] + 2 * pad
     cx, cy = W / 2, (top + bottom) / 2
     crect = (cx - cw / 2, cy - ch / 2, cx + cw / 2, cy + ch / 2)
-    sc.rrect(crect, 22, t["band"], None, 0, "center")
+    sc.rrect(crect, t["r0"], t["band"], None, 0, "center")
     sc.boxes["center"] = (crect[0] + 8, crect[1] + 8, crect[2] - 8, crect[3] - 8)
     cp = cplan[1][0]
     saved = t["ink"], t["txt"]
@@ -594,14 +612,14 @@ def _hub(sc, spec, nodes, top, bottom):
         owner = f"n{i + 1}"
         x, y = cx + dx - sw / 2, cy + dy - sh / 2
         rect = (x, y, x + sw, y + sh)
-        sc.rrect(rect, 18, t["card"], a, 3, owner)
+        sc.rrect(rect, t["r0"], t["card"], a, _w(t, a), owner)
         sc.boxes[owner] = (x + 8, y + 8, x + sw - 8, y + sh - 8)
         _draw_node(sc, plans[i], x + pad, y + (sh - plans[i]["h"]) / 2, sw - 2 * pad, size, a, owner, t["card"])
         lk = links[i] if links else {}
         p = _edge(crect, (cx + dx, cy + dy))
         q = _edge(rect, (cx, cy))
         d = lk.get("dir", "out")
-        sc.arrow(p, q, t["line"], f"link{i + 1}", width=3, start=d in ("in", "both"), end=d in ("out", "both"))
+        sc.arrow(p, q, t["line"], f"link{i + 1}", start=d in ("in", "both"), end=d in ("out", "both"))
         if lk.get("label"):
             err = sc.pill((p[0] + q[0]) / 2, (p[1] + q[1]) / 2, lk["label"], f"link{i + 1}:pill")
             if err:
@@ -626,14 +644,14 @@ def _cycle(sc, spec, nodes, top, bottom):
     for i, rect in enumerate(rects):
         a = _accent(t, nodes[i], i == spec.get("highlight"))
         owner = f"n{i + 1}"
-        sc.rrect(rect, 18, t["card"], a, 3, owner)
+        sc.rrect(rect, t["r0"], t["card"], a, _w(t, a), owner)
         sc.boxes[owner] = (rect[0] + 8, rect[1] + 8, rect[2] - 8, rect[3] - 8)
         _draw_node(sc, plans[i], rect[0] + pad, rect[1] + (sh - plans[i]["h"]) / 2, sw - 2 * pad, size, a, owner, t["card"], i + 1)
     errors = []
     for i in range(n):
         j = (i + 1) % n
         p, q = _edge(rects[i], pos[j], 10), _edge(rects[j], pos[i], 10)
-        sc.arrow(p, q, t["line"], f"link{i + 1}", width=3)
+        sc.arrow(p, q, t["line"], f"link{i + 1}")
         if links and links[i].get("label"):
             mx, my = (p[0] + q[0]) / 2, (p[1] + q[1]) / 2
             d = math.hypot(mx - cx, my - cy) or 1
@@ -658,38 +676,43 @@ def _cycle(sc, spec, nodes, top, bottom):
 def _nested(sc, spec, nodes, top, bottom):
     t = sc.t
     n = len(nodes)
+    # konzentrisch: Außenradius = Innenradius + Abstand je Ebene (Apple HIG); Text rückt mit dem Radius ein,
+    # damit er nie in die Rundung ragt (Bogen-Einzug bei 45° ≈ 0,29 · r)
+    radii = [t["r0"] + (n - 1 - i) * 40 if t["concentric"] else t["r0"] for i in range(n)]
+    pads = [max(28, 0.3 * r + 12) for r in radii]
     heads = []
     for i, node in enumerate(nodes[:-1]):
-        p = _plan(dict(title=node.get("title", ""), text=node.get("text", "")), W - 2 * M - 56 - 80 * i, 20, title_max=26)
+        p = _plan(dict(title=node.get("title", ""), text=node.get("text", "")), W - 2 * M - 2 * pads[i] - 80 * i, 20, title_max=26)
         if isinstance(p, str):
             raise LayoutError(f"Ebene {i + 1} („{node.get('title', '')}“): {p}")
         if p["text"] and len(p["text"]) > 1:
             raise LayoutError(f"Ebene {i + 1} („{node.get('title', '')}“): Text ≤ 1 Zeile (äußere Ebenen tragen nur Titel + Kurzsatz).")
         heads.append(p)
-    shell = sum(p["h"] + 40 for p in heads) + 28 * (n - 1)
-    w_in = W - 2 * M - 56 - 80 * (n - 1)
+    shell = sum(p["h"] + pads[i] + 18 for i, p in enumerate(heads)) + 40 * (n - 1)
+    w_in = W - 2 * M - 2 * pads[-1] - 80 * (n - 1)
     if bottom - top - shell < 150:
         raise LayoutError("Zu viele Ebenen für die Höhe: maximal 3–4 Ebenen, Texte der äußeren Ebenen kürzen.")
     size, plans = _fit_nodes(nodes[-1:], [w_in], [bottom - top - shell - 56], range(24, MIN_PX - 1, -1), title_max=30)
     total = min(bottom - top, shell + max(plans[0]["h"] + 72, 170))
     y0 = top + (bottom - top - total) / 2
     rect = (M, y0, W - M, y0 + total)
+    radii = [min(r, total / 4) for r in radii]
     for i, node in enumerate(nodes):
         a = _accent(t, node, i == spec.get("highlight"))
         owner = f"n{i + 1}"
         fill = _mix(t["bg"], t["card"], 0.35 + 0.65 * i / (n - 1))
-        sc.ops.append(("rrect", rect, 26, fill, a, 3))
+        sc.ops.append(("rrect", rect, radii[i], fill, a, _w(t, a)))
         if i == n - 1:
             p = plans[0]
             sc.boxes[owner] = (rect[0] + 8, rect[1] + 8, rect[2] - 8, rect[3] - 8)
             sc.marks.append((("rect", rect), owner))
-            _draw_node(sc, p, rect[0] + 28, rect[1] + (rect[3] - rect[1] - p["h"]) / 2, w_in, size, a, owner, fill)
+            _draw_node(sc, p, rect[0] + pads[i], rect[1] + (rect[3] - rect[1] - p["h"]) / 2, w_in, size, a, owner, fill)
             break
         p = heads[i]
-        head = p["h"] + 40
+        head = p["h"] + pads[i] + 18
         sc.boxes[owner] = (rect[0] + 8, rect[1] + 8, rect[2] - 8, rect[1] + head)
-        _draw_node(sc, p, rect[0] + 28, rect[1] + 22, rect[2] - rect[0] - 56, 20, a, owner, fill)
-        rect = (rect[0] + 40, rect[1] + head, rect[2] - 40, rect[3] - 28)
+        _draw_node(sc, p, rect[0] + pads[i], rect[1] + pads[i], rect[2] - rect[0] - 2 * pads[i], 20, a, owner, fill)
+        rect = (rect[0] + 40, rect[1] + head, rect[2] - 40, rect[3] - 40)
     return []
 
 
@@ -965,7 +988,11 @@ def _html(spec, nodes, sc, alt):
 
 
 def render(spec, name="grafik", outdir="."):
-    theme = THEMES[spec.get("theme", "dark")]
+    style = spec.get("style", "modern")
+    if style not in STYLES or spec.get("theme", "dark") not in THEMES:
+        raise LayoutError(f"style: {', '.join(STYLES)} · theme: {', '.join(THEMES)}")
+    # Erweiterungspunkt: tokens überschreibt Palette/Formen (Marke, DESIGN.md, Folienmaster) – die Prüfung gilt trotzdem
+    theme = {**THEMES[spec.get("theme", "dark")], **STYLES[style], **(spec.get("tokens") or {})}
     sc = _layout(spec, theme)
     nodes = spec.get("nodes") or spec.get("cards") or []
     problems, words, min_px, min_cr = _lint(sc, spec)
