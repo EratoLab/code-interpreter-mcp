@@ -31,7 +31,7 @@ Regel (deckt sich mit Adobe Leonardo, Material Color Utilities, Radix Custom Pal
 
 ## 2. Formensprache als Presets (`pitchkit.STYLES`)
 
-Ein Basisradius steuert alles; verschachtelte Flächen sind konzentrisch (innen = außen − Abstand, [WWDC25-356](https://developer.apple.com/videos/play/wwdc2025/356/)); Text rückt mit dem Radius ein (≥ 0,3 · r + 12), damit er nie in die Rundung ragt.
+Ein Basisradius steuert alles. Verschachtelte Flächen behalten **denselben Radius auf jeder Ebene**: Apples konzentrische Regel (außen = innen + Abstand, [WWDC25-356](https://developer.apple.com/videos/play/wwdc2025/356/)) ist für kleine Abstände gedacht – bei unseren 40 px blähte sie die äußeren Ringe auf (12 → 52 → 92 px) und wirkte wie eine andere Formensprache (verworfen 28.10.2026). Text rückt mit dem Radius ein (≥ 0,3 · r + 12), damit er nie in die Rundung ragt.
 
 | Token | classic | **modern** (Standard) | friendly |
 |---|---|---|---|
@@ -39,7 +39,7 @@ Ein Basisradius steuert alles; verschachtelte Flächen sind konzentrisch (innen 
 | Pillen/Chips | r0 | min(h/2, r0) | h/2 |
 | Badges | eckig (r 3) | rund | rund |
 | Strich neutral / Akzent | 1,5 / 2,5 | 2 / 3 | 2,5 / 4 |
-| konzentrisch | nein (Ecken zu klein) | ja | ja |
+| Verschachtelung | gleicher Radius | gleicher Radius | gleicher Radius |
 
 Vorbild: [Radix Themes radius](https://github.com/radix-ui/themes/blob/main/packages/radix-ui-themes/src/styles/tokens/radius.css) (Faktor 0/0,75/1/1,5/full), [shadcn `--radius`](https://ui.shadcn.com/docs/theming), [Material 3 shape scale](https://github.com/material-components/material-web/blob/main/tokens/versions/latest/sass/_md-sys-shape.scss).
 

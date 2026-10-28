@@ -49,12 +49,12 @@ THEMES = {
         band="#4338CA", band_ink="#FFFFFF", accents=["#047857", "#2563EB", "#B45309", "#7C3AED"],
     ),
 }
-# Formensprache: ein Basisradius r0 steuert alle Radien (innen = außen − Abstand, nie < r_min),
-# zwei Strichstärken (stroke = neutral, strong = Akzent/Verbindung). Inhalt und Stil bleiben getrennt.
+# Formensprache: ein Basisradius r0 für alle Flächen – auch verschachtelte Ebenen behalten denselben Radius,
+# damit die Rundung von innen nach außen gleich wirkt. Zwei Strichstärken (stroke = neutral, strong = Akzent/Verbindung).
 STYLES = {
-    "classic": dict(r0=4, r_min=0, stroke=1.5, strong=2.5, pill="r0", badge_r=3, concentric=False),
-    "modern": dict(r0=12, r_min=4, stroke=2, strong=3, pill="min", badge_r=20, concentric=True),
-    "friendly": dict(r0=24, r_min=8, stroke=2.5, strong=4, pill="full", badge_r=20, concentric=True),
+    "classic": dict(r0=4, stroke=1.5, strong=2.5, pill="r0", badge_r=3),
+    "modern": dict(r0=12, stroke=2, strong=3, pill="min", badge_r=20),
+    "friendly": dict(r0=24, stroke=2.5, strong=4, pill="full", badge_r=20),
 }
 LIMITS = {"flow": (1, 4), "layers": (2, 5), "matrix": (4, 4), "hub": (3, 6), "cycle": (3, 6), "nested": (2, 4)}
 
@@ -676,9 +676,10 @@ def _cycle(sc, spec, nodes, top, bottom):
 def _nested(sc, spec, nodes, top, bottom):
     t = sc.t
     n = len(nodes)
-    # konzentrisch: Außenradius = Innenradius + Abstand je Ebene (Apple HIG); Text rückt mit dem Radius ein,
-    # damit er nie in die Rundung ragt (Bogen-Einzug bei 45° ≈ 0,29 · r)
-    radii = [t["r0"] + (n - 1 - i) * 40 if t["concentric"] else t["r0"] for i in range(n)]
+    # Gleicher Radius auf allen Ebenen: „konzentrisch“ (außen = innen + Abstand) bläht bei 40 px Abstand
+    # die äußeren Ringe zur Pille auf. Text rückt mit dem Radius ein (Bogen-Einzug bei 45° ≈ 0,29 · r),
+    # falls tokens einen großen r0 setzen.
+    radii = [t["r0"]] * n
     pads = [max(28, 0.3 * r + 12) for r in radii]
     heads = []
     for i, node in enumerate(nodes[:-1]):
