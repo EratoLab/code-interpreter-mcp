@@ -275,6 +275,20 @@ async fn op_fetch_url(
     Ok(bytes.as_ref().clone().into())
 }
 
+// Request-local buffers are consumed once and moved into V8 backing stores.
+struct InputFileBuffers(Vec<Option<Vec<u8>>>);
+
+#[op2]
+fn op_take_input_file(state: &mut OpState, index: u32) -> Result<Uint8Array, JsErrorBox> {
+    state
+        .borrow_mut::<InputFileBuffers>()
+        .0
+        .get_mut(index as usize)
+        .and_then(Option::take)
+        .map(Into::into)
+        .ok_or_else(|| JsErrorBox::generic("Input file is unavailable or already consumed"))
+}
+
 #[op2]
 async fn op_read_package_layer_file(
     state: Rc<RefCell<OpState>>,
@@ -326,6 +340,7 @@ deno_core::extension!(
     deps = [deno_webidl, deno_web],
     ops = [
         op_fetch_url,
+        op_take_input_file,
         op_read_package_layer_file,
         op_fetch_content_type,
         op_random_fill,
@@ -335,6 +350,7 @@ deno_core::extension!(
     options = { config: RuntimeConfig },
     state = |state, options| {
         state.put(options.config);
+        state.put(InputFileBuffers(Vec::new()));
         state.put(UserExecutionStarted(false)); // User execution has not started.
     },
 );
@@ -528,7 +544,7 @@ fn worker_thread(
         .and_then(|mut isolate| {
             guard.1.set("executing");
             let start = Instant::now();
-            let result = runtime.block_on(execute_python(&mut isolate, &job.request));
+            let result = runtime.block_on(execute_python(&mut isolate, job.request));
             let outcome = match &result {
                 Ok(output) => output.outcome(),
                 Err(_) => "runtime_failure",
@@ -671,13 +687,22 @@ async fn initialize_pyodide(
 
 async fn execute_python(
     runtime: &mut JsRuntime,
-    request: &RuntimeRequest,
+    mut request: RuntimeRequest,
 ) -> Result<RunPythonCodeOutput> {
     runtime
         .op_state()
         .borrow_mut()
         .put(UserExecutionStarted(true));
-    let request_json = serde_json::to_string(request).context("could not serialize request")?;
+    let buffers = request
+        .files
+        .iter_mut()
+        .map(|file| Some(std::mem::take(&mut file.bytes)))
+        .collect();
+    runtime
+        .op_state()
+        .borrow_mut()
+        .put(InputFileBuffers(buffers));
+    let request_json = serde_json::to_string(&request).context("could not serialize request")?;
     let quoted_json =
         serde_json::to_string(&request_json).expect("serializing a string cannot fail");
     runtime.execute_script(
@@ -1040,6 +1065,30 @@ mod tests {
             // Startup, cold workers and warm replacements share this factory.
             for _ in 0..2 {
                 let mut runtime = create_runtime(&runtime_config.clone()).unwrap();
+                runtime
+                    .execute_script(
+                        "<test_no_input_buffers>",
+                        r#"
+                    let rejected = false;
+                    try { __takeInputFile(0); } catch (_) { rejected = true; }
+                    if (!rejected) throw Error('buffer leaked across isolates');
+                "#,
+                    )
+                    .unwrap();
+                runtime
+                    .op_state()
+                    .borrow_mut()
+                    .put(InputFileBuffers(vec![Some(vec![0, 255]), Some(vec![])]));
+                runtime.execute_script("<test_input_buffers>", r#"
+                    const bytes = __takeInputFile(0);
+                    if (bytes.length !== 2 || bytes[0] !== 0 || bytes[1] !== 255) throw Error('bytes');
+                    if (__takeInputFile(1).length !== 0) throw Error('empty');
+                    for (const index of [0, 1, 2, 4294967295]) {
+                        let rejected = false;
+                        try { __takeInputFile(index); } catch (_) { rejected = true; }
+                        if (!rejected) throw Error('input buffer reused or out of bounds');
+                    }
+                "#).unwrap();
                 assert_eq!(
                     runtime.v8_isolate().get_heap_statistics().heap_size_limit(),
                     runtime_config.memory_limit_bytes,
@@ -1229,6 +1278,46 @@ mod tests {
                 timeout_ms: 120_000,
             })
             .await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires npm ci and HTTPS package downloads"]
+    async fn input_buffers_mount_and_are_isolated() {
+        let config: AppConfig = toml::from_str("").unwrap();
+        let runtime = PyodideRuntime::new(&config).await.unwrap();
+        let input = crate::RunPythonCodeRequest {
+            code: r#"from pathlib import Path
+assert Path('nested/binary.bin').read_bytes() == bytes(range(256))
+assert Path('unicode.txt').read_text() == 'Grüße 🦀'
+assert Path('empty').read_bytes() == b''
+Path('nested/binary.bin').write_bytes(b'changed')
+print('mounted')"#
+                .into(),
+            files: [
+                ("nested/binary.bin", (0..=255).collect::<Vec<u8>>()),
+                ("unicode.txt", "Grüße 🦀".as_bytes().to_vec()),
+                ("empty", vec![]),
+            ]
+            .into_iter()
+            .map(|(path, bytes)| crate::InputFile {
+                path: path.into(),
+                content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            })
+            .collect(),
+            timeout_ms: None,
+        };
+        let request =
+            crate::validate_request(input, config.input_limits.validate().unwrap()).unwrap();
+        let output = runtime.execute(request).await;
+        assert!(output.success, "{output:?}");
+        assert_eq!(output.stdout, "mounted\n");
+        assert!(output.files.is_empty());
+        let output = run(
+            &runtime,
+            "from pathlib import Path\nassert not list(Path('/workspace').iterdir())",
+        )
+        .await;
+        assert!(output.success, "{output:?}");
     }
 
     // These exercise real Pyodide and need npm assets and package-download access.

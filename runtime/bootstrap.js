@@ -6,6 +6,7 @@
     op_fetch_content_type,
     op_fetch_url,
     op_read_package_layer_file,
+    op_take_input_file,
     op_random_fill,
     op_package_log,
   } = core.ops;
@@ -230,6 +231,7 @@
   globalThis.window = globalThis;
   globalThis.self = globalThis;
   globalThis.__packageLog = op_package_log;
+  globalThis.__takeInputFile = op_take_input_file;
   globalThis.__readPackageLayerFile = op_read_package_layer_file;
   globalThis.__createSafeGlobals = createSafeGlobals;
   globalThis.__resetCapture = resetCapture;
