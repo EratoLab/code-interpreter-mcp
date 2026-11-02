@@ -99,15 +99,13 @@ function collectCreatedFiles(FS, initialFiles) {
 
   try {
     pyodide.FS.mkdirTree("/workspace");
-    for (const file of request.files) {
+    for (const [index, file] of request.files.entries()) {
       const target = `/workspace/${file.path}`;
       const parent = target.slice(0, target.lastIndexOf("/"));
       pyodide.FS.mkdirTree(parent);
-      const binary = atob(file.content_base64);
-      const bytes = Uint8Array.from(binary, (character) =>
-        character.charCodeAt(0)
-      );
-      pyodide.FS.writeFile(target, bytes);
+      const bytes = globalThis.__takeInputFile(index);
+      // MEMFS owns this fresh buffer; no second full-file copy is needed.
+      pyodide.FS.writeFile(target, bytes, { canOwn: true });
     }
     pyodide.FS.chdir("/workspace");
     initialFiles = new Set(

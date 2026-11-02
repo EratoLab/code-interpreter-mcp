@@ -220,7 +220,9 @@ pub(crate) struct RuntimeRequest {
 #[derive(Debug, Serialize)]
 pub(crate) struct ValidatedFile {
     pub(crate) path: String,
-    pub(crate) content_base64: String,
+    // Only the path enters request JSON; the host op transfers ownership of bytes.
+    #[serde(skip)]
+    pub(crate) bytes: Vec<u8>,
 }
 
 // Removing a queued request also runs when rmcp drops the handler future.
@@ -563,7 +565,7 @@ fn validate_request(request: RunPythonCodeRequest, limits: InputLimits) -> Resul
 
         files.push(ValidatedFile {
             path,
-            content_base64: BASE64.encode(decoded),
+            bytes: decoded,
         });
     }
 
@@ -1556,6 +1558,34 @@ mod tests {
             }
         }
         task.abort();
+    }
+
+    #[test]
+    fn validated_files_retain_bytes_but_serialize_only_paths() {
+        let data = [b"\x00\xff\x80".as_slice(), "Grüße 🦀".as_bytes(), b""];
+        let input = RunPythonCodeRequest {
+            code: "pass".into(),
+            files: data
+                .iter()
+                .enumerate()
+                .map(|(index, bytes)| InputFile {
+                    path: format!("{index}.bin"),
+                    content_base64: BASE64.encode(bytes),
+                })
+                .collect(),
+            timeout_ms: None,
+        };
+        let validated = validate_request(input, default_limits()).unwrap();
+        for (file, bytes) in validated.files.iter().zip(data) {
+            assert_eq!(file.bytes, bytes);
+        }
+        let json = serde_json::to_value(&validated).unwrap();
+        assert_eq!(
+            json["files"],
+            serde_json::json!([
+                {"path": "0.bin"}, {"path": "1.bin"}, {"path": "2.bin"}
+            ])
+        );
     }
 
     #[test]
