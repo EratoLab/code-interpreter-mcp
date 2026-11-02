@@ -133,6 +133,8 @@ impl RunPythonCodeOutput {
             Some("validation") => "validation_error",
             Some("overloaded") => "overload",
             Some("python") => "python_error",
+            Some("memory_limit") => "memory_limit",
+            Some("cancelled") => "cancelled",
             _ => "runtime_failure",
         }
     }
@@ -341,7 +343,7 @@ impl CodeInterpreterMcpServer {
                 _ = request_cancellation.cancelled() => {
                     cancellation.store(true, Ordering::Release);
                     self.runtime.cancel_queued(job_id);
-                    return Json(RunPythonCodeOutput::runtime("Request cancelled while waiting for a worker"));
+                    return Json(RunPythonCodeOutput::failure("cancelled", "Request cancelled", None, false));
                 }
                 _ = progress_interval.tick(), if progress_token.is_some() => {
                     let Some(position) = self.runtime.queue_position(job_id) else {

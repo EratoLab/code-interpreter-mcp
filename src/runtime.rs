@@ -35,6 +35,108 @@ const PYODIDE_PACKAGE_CDN: &str = "cdn.jsdelivr.net";
 const PACKAGE_CACHE_SCHEMA: u32 = 1;
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 
+// A fixed reserve, granted at most once, lets V8 finish its current allocation
+// and observe termination. It is not an additional execution budget.
+const EMERGENCY_HEAP_BYTES: usize = 64 * 1024 * 1024;
+const INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(300);
+const MEMORY: usize = 1;
+const TIMEOUT: usize = 2;
+const CANCELLED: usize = 3;
+
+#[derive(Clone)]
+struct Termination {
+    cause: Arc<AtomicUsize>,
+    memory_limit_bytes: usize,
+}
+
+impl Termination {
+    fn error(&self, phase: &str) -> Option<anyhow::Error> {
+        let cause = self.cause.load(Ordering::Acquire);
+        let message = match cause {
+            MEMORY => format!(
+                "V8 memory limit of {} MiB reached during {phase}; execution was terminated and the isolate discarded",
+                self.memory_limit_bytes / (1024 * 1024)
+            ),
+            TIMEOUT => format!("{phase} exceeded its time limit"),
+            CANCELLED => format!("{phase} was cancelled"),
+            _ => return None,
+        };
+        Some(anyhow::anyhow!(TerminationError { cause, message }))
+    }
+}
+
+#[derive(Debug)]
+struct TerminationError {
+    cause: usize,
+    message: String,
+}
+
+impl std::fmt::Display for TerminationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for TerminationError {}
+
+// Own and join the watchdog on every exit, including early errors and unwinds.
+struct ExecutionWatchdog {
+    finished: mpsc::SyncSender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ExecutionWatchdog {
+    fn start(
+        runtime: &mut JsRuntime,
+        timeout: Duration,
+        cancelled: Arc<AtomicBool>,
+    ) -> (Self, Termination) {
+        let termination = runtime.op_state().borrow().borrow::<Termination>().clone();
+        let cause = termination.cause.clone();
+        let handle = runtime.v8_isolate().thread_safe_handle();
+        let (finished, receiver) = mpsc::sync_channel(1);
+        let deadline = Instant::now() + timeout;
+        let thread = std::thread::spawn(move || {
+            loop {
+                let reason = if cancelled.load(Ordering::Acquire) {
+                    CANCELLED
+                } else if Instant::now() >= deadline {
+                    TIMEOUT
+                } else {
+                    0
+                };
+                if reason != 0 {
+                    let _ = cause.compare_exchange(0, reason, Ordering::AcqRel, Ordering::Acquire);
+                    handle.terminate_execution();
+                    break;
+                }
+                match receiver.recv_timeout(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                ) {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    _ => break,
+                }
+            }
+        });
+        (
+            Self {
+                finished,
+                thread: Some(thread),
+            },
+            termination,
+        )
+    }
+}
+
+impl Drop for ExecutionWatchdog {
+    fn drop(&mut self) {
+        let _ = self.finished.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct RuntimeConfig {
     memory_limit_bytes: usize,
@@ -544,7 +646,11 @@ fn worker_thread(
         .and_then(|mut isolate| {
             guard.1.set("executing");
             let start = Instant::now();
-            let result = runtime.block_on(execute_python(&mut isolate, job.request));
+            let result = runtime.block_on(execute_python(
+                &mut isolate,
+                job.request,
+                job.cancelled.clone(),
+            ));
             let outcome = match &result {
                 Ok(output) => output.outcome(),
                 Err(_) => "runtime_failure",
@@ -555,9 +661,7 @@ fn worker_thread(
         });
         let output = match result {
             Ok(output) => output,
-            Err(error) => RunPythonCodeOutput::runtime(format!(
-                "The embedded Deno/Pyodide runtime failed: {error:#}"
-            )),
+            Err(error) => termination_output(error),
         };
         let _ = job.response.send(output);
 
@@ -604,12 +708,29 @@ fn create_runtime(config: &RuntimeConfig) -> Result<JsRuntime> {
         .into_iter()
         .map(embed_extension_sources)
         .collect::<Result<Vec<_>>>()?;
-    JsRuntime::try_new(RuntimeOptions {
+    let mut runtime = JsRuntime::try_new(RuntimeOptions {
         extensions,
         create_params: Some(v8::Isolate::create_params().heap_limits(0, config.memory_limit_bytes)),
         ..Default::default()
     })
-    .context("could not initialize the embedded Deno runtime")
+    .context("could not initialize the embedded Deno runtime")?;
+    let termination = Termination {
+        cause: Arc::new(AtomicUsize::new(0)),
+        memory_limit_bytes: config.memory_limit_bytes,
+    };
+    let cause = termination.cause.clone();
+    let handle = runtime.v8_isolate().thread_safe_handle();
+    // deno_core owns this closure until isolate disposal. No allocation, logging,
+    // or JS re-entry is permitted here. Memory takes precedence over a racing timer.
+    // Callback limits are old-generation sizes, not total heap statistics.
+    // Anchor the reserve to the initial limit so repeated calls cannot grow it.
+    runtime.add_near_heap_limit_callback(move |current_limit, initial_limit| {
+        cause.store(MEMORY, Ordering::Release);
+        handle.terminate_execution();
+        current_limit.max(initial_limit.saturating_add(EMERGENCY_HEAP_BYTES))
+    });
+    runtime.op_state().borrow_mut().put(termination);
+    Ok(runtime)
 }
 
 async fn create_initialized_isolate(
@@ -622,6 +743,33 @@ async fn create_initialized_isolate(
 }
 
 async fn initialize_pyodide(
+    runtime: &mut JsRuntime,
+    config: &RuntimeConfig,
+    build_package_layer: bool,
+) -> Result<Option<PackageLayer>> {
+    let (watchdog, termination) = ExecutionWatchdog::start(
+        runtime,
+        INITIALIZATION_TIMEOUT,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let result = tokio::time::timeout(
+        INITIALIZATION_TIMEOUT,
+        initialize_pyodide_inner(runtime, config, build_package_layer),
+    )
+    .await;
+    if result.is_err() {
+        let _ = termination
+            .cause
+            .compare_exchange(0, TIMEOUT, Ordering::AcqRel, Ordering::Acquire);
+    }
+    drop(watchdog);
+    if let Some(error) = termination.error("Pyodide/package initialization") {
+        return Err(error);
+    }
+    result.context("Pyodide initialization timed out")?
+}
+
+async fn initialize_pyodide_inner(
     runtime: &mut JsRuntime,
     config: &RuntimeConfig,
     build_package_layer: bool,
@@ -685,7 +833,75 @@ async fn initialize_pyodide(
     Ok(layer)
 }
 
+fn termination_output(error: anyhow::Error) -> RunPythonCodeOutput {
+    if let Some(termination) = error.downcast_ref::<TerminationError>() {
+        return match termination.cause {
+            MEMORY => RunPythonCodeOutput::failure(
+                "memory_limit",
+                termination.message.clone(),
+                None,
+                false,
+            ),
+            TIMEOUT => {
+                RunPythonCodeOutput::failure("timeout", termination.message.clone(), None, true)
+            }
+            CANCELLED => {
+                RunPythonCodeOutput::failure("cancelled", termination.message.clone(), None, false)
+            }
+            _ => unreachable!(),
+        };
+    }
+    RunPythonCodeOutput::runtime(format!(
+        "The embedded Deno/Pyodide runtime failed: {error:#}"
+    ))
+}
+
 async fn execute_python(
+    runtime: &mut JsRuntime,
+    request: RuntimeRequest,
+    cancelled: Arc<AtomicBool>,
+) -> Result<RunPythonCodeOutput> {
+    if cancelled.load(Ordering::Acquire) {
+        return Ok(RunPythonCodeOutput::failure(
+            "cancelled",
+            "Request cancelled",
+            None,
+            false,
+        ));
+    }
+    let timeout_ms = request.timeout_ms;
+    let timeout = Duration::from_millis(timeout_ms);
+    let (watchdog, termination) = ExecutionWatchdog::start(runtime, timeout, cancelled.clone());
+    let result = tokio::select! {
+        result = tokio::time::timeout(timeout, execute_python_inner(runtime, request)) => {
+            match result {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = termination.cause.compare_exchange(0, TIMEOUT, Ordering::AcqRel, Ordering::Acquire);
+                    Err(anyhow::anyhow!("execution timed out"))
+                }
+            }
+        }
+        _ = async {
+            while !cancelled.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        } => {
+            let _ = termination.cause.compare_exchange(0, CANCELLED, Ordering::AcqRel, Ordering::Acquire);
+            Err(anyhow::anyhow!("execution cancelled"))
+        }
+    };
+    drop(watchdog);
+    if termination.cause.load(Ordering::Acquire) == TIMEOUT {
+        return Ok(RunPythonCodeOutput::timed_out(timeout_ms));
+    }
+    if let Some(error) = termination.error("request injection or execution") {
+        return Ok(termination_output(error));
+    }
+    result
+}
+
+async fn execute_python_inner(
     runtime: &mut JsRuntime,
     mut request: RuntimeRequest,
 ) -> Result<RunPythonCodeOutput> {
@@ -710,20 +926,6 @@ async fn execute_python(
         format!("globalThis.__request = JSON.parse({quoted_json});"),
     )?;
 
-    let isolate_handle = runtime.v8_isolate().thread_safe_handle();
-    let (finished_tx, finished_rx) = mpsc::sync_channel(1);
-    let timeout = Duration::from_millis(request.timeout_ms);
-    let timed_out = Arc::new(AtomicBool::new(false));
-    let watchdog_timed_out = timed_out.clone();
-    let watchdog = std::thread::spawn(move || {
-        if matches!(
-            finished_rx.recv_timeout(timeout),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ) {
-            watchdog_timed_out.store(true, Ordering::Release);
-            isolate_handle.terminate_execution();
-        }
-    });
     let result =
         match runtime.execute_script("<execute_python>", include_str!("../runtime/execute.js")) {
             Ok(execution) =>
@@ -739,11 +941,6 @@ async fn execute_python(
             }
             Err(error) => Err(anyhow::anyhow!(error.to_string())),
         };
-    let _ = finished_tx.send(());
-    let _ = watchdog.join();
-    if timed_out.load(Ordering::Acquire) {
-        return Ok(RunPythonCodeOutput::timed_out(request.timeout_ms));
-    }
     let value = result?;
     deno_core::scope!(scope, runtime);
     let local = v8::Local::new(scope, value);
@@ -1045,6 +1242,214 @@ async fn fetch_url(config: &RuntimeConfig, raw_url: &str) -> Result<Arc<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pressure_config(memory_limit_mb: usize) -> RuntimeConfig {
+        RuntimeConfig {
+            memory_limit_bytes: memory_limit_mb * 1024 * 1024,
+            allowed_hosts: Arc::new(HashSet::new()),
+            asset_dir: Arc::new(PathBuf::new()),
+            client: reqwest::Client::new(),
+            download_cache: Arc::new(Mutex::new(HashMap::new())),
+            content_types: Arc::new(Mutex::new(HashMap::new())),
+            preinstall_packages: Vec::new(),
+            runtime_package_installation: false,
+            package_cache_dir: Arc::new(PathBuf::new()),
+            package_layer: None,
+        }
+    }
+
+    // V8 aborts cannot be caught by Rust: all pressure cases run in a child.
+    #[test]
+    fn heap_pressure_child_process() {
+        run_child_test(
+            "runtime::tests::heap_pressure_child",
+            Duration::from_secs(90),
+        );
+    }
+
+    fn run_child_test(name: &str, timeout: Duration) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--ignored", "--nocapture"])
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "heap-pressure child failed: {status}");
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("heap-pressure child exceeded {timeout:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "potentially fatal; invoked by heap_pressure_child_process"]
+    async fn heap_pressure_child() {
+        let config = pressure_config(32);
+        // Exercise repeated replacement creation and a JS allocation loop
+        // independent of base64 decoding and Python/Wasm allocations.
+        for _ in 0..2 {
+            let mut runtime = create_runtime(&config).unwrap();
+            let (watchdog, termination) = ExecutionWatchdog::start(
+                &mut runtime,
+                Duration::from_secs(20),
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert!(runtime.execute_script("<pressure>",
+                "globalThis.retained = []; while (true) retained.push(new Array(10000).fill(123));"
+            ).is_err());
+            drop(watchdog);
+            let output = termination_output(termination.error("allocation test").unwrap());
+            assert_eq!(output.error.unwrap().kind, "memory_limit");
+            assert!(!output.timed_out);
+            let actual_limit = runtime.v8_isolate().get_heap_statistics().heap_size_limit();
+            assert!(
+                actual_limit <= config.memory_limit_bytes + EMERGENCY_HEAP_BYTES,
+                "actual heap limit: {actual_limit}"
+            );
+            drop(runtime);
+            let mut replacement = create_runtime(&config).unwrap();
+            replacement.execute_script("<small>", "1 + 1").unwrap();
+        }
+
+        // The same guarded initializer serves startup, package-layer building,
+        // on-demand creation and warm replacement.
+        let assets = std::env::temp_dir().join(format!("ermcp-pressure-{}", std::process::id()));
+        fs::create_dir_all(&assets).unwrap();
+        fs::write(assets.join("pyodide.asm.mjs"),
+            "// import.meta.url import.meta.url import.meta.url\nconst _createPyodideModule = null; export default _createPyodideModule; globalThis.retained = []; while(true) retained.push(new Array(10000).fill(123));"
+        ).unwrap();
+        let mut init_config = config.clone();
+        init_config.asset_dir = Arc::new(assets.clone());
+        for build_layer in [false, true] {
+            let mut runtime = create_runtime(&init_config).unwrap();
+            let error = initialize_pyodide(&mut runtime, &init_config, build_layer)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<TerminationError>().unwrap().cause,
+                MEMORY
+            );
+            assert!(error.to_string().contains("initialization"));
+        }
+        fs::remove_dir_all(assets).unwrap();
+
+        // Allocation during request injection must be classified too.
+        let mut runtime = create_runtime(&config).unwrap();
+        let mut large = request();
+        large.code = "x".repeat(40 * 1024 * 1024);
+        large.timeout_ms = 20_000;
+        let output = execute_python(&mut runtime, large, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        assert_eq!(output.error.unwrap().kind, "memory_limit");
+        assert!(!output.timed_out);
+        drop(runtime);
+
+        // Use a JS stand-in to exercise synchronous termination and pending
+        // promises without depending on Pyodide's network assets.
+        for (code, cancelled, expected) in [
+            ("while (true) {}", false, "timeout"),
+            (
+                "return new Promise(resolve => setTimeout(resolve, 10000))",
+                false,
+                "timeout",
+            ),
+            ("while (true) {}", true, "cancelled"),
+        ] {
+            let mut runtime = create_runtime(&config).unwrap();
+            runtime.execute_script("<stub>", format!(
+                "globalThis.__resetCapture = () => {{}}; globalThis.__packagePolicy = {{runtime_package_installation:false}}; globalThis.__pyodide = {{FS: {{mkdirTree(){{}}, chdir(){{}}, readdir(){{return [];}}}}, runPythonAsync: () => {{{code}}}}};"
+            )).unwrap();
+            let mut req = request();
+            req.timeout_ms = if cancelled { 1000 } else { 30 };
+            let cancellation = Arc::new(AtomicBool::new(false));
+            let signal = cancellation.clone();
+            let canceller = cancelled.then(|| {
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(10));
+                    signal.store(true, Ordering::Release);
+                })
+            });
+            let output = execute_python(&mut runtime, req, cancellation)
+                .await
+                .unwrap();
+            if let Some(canceller) = canceller {
+                canceller.join().unwrap();
+            }
+            assert_eq!(output.error.unwrap().kind, expected);
+            assert_eq!(output.timed_out, expected == "timeout");
+        }
+    }
+
+    // Python objects live in Wasm memory, outside the V8 heap budget. Keep
+    // V8 arrays alive through Python's JS bridge to exercise that budget from
+    // user code without depending on the file mounting implementation.
+    const PYTHON_HEAP_PRESSURE: &str = r#"
+from pyodide.ffi import to_js
+chunk = [123] * 100_000
+retained = []
+while True:
+    retained.append(to_js(chunk))
+"#;
+
+    #[test]
+    #[ignore = "requires npm assets and the micropip wheel"]
+    fn python_heap_pressure_child_process() {
+        run_child_test(
+            "runtime::tests::python_heap_pressure_child",
+            Duration::from_secs(180),
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "potentially fatal; invoked by python_heap_pressure_child_process"]
+    async fn python_heap_pressure_child() {
+        if std::env::var_os("ERMCP_HEAP_BASELINE").is_some() {
+            let mut config = pressure_config(512);
+            config.asset_dir =
+                Arc::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("node_modules/pyodide"));
+            let mut runtime = create_initialized_isolate(&config, false).await.unwrap();
+            runtime.remove_near_heap_limit_callback(config.memory_limit_bytes);
+            let output = execute_python(
+                &mut runtime,
+                RuntimeRequest {
+                    code: PYTHON_HEAP_PRESSURE.into(),
+                    files: vec![],
+                    timeout_ms: 120_000,
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+            panic!("unguarded Python allocation did not abort: {output:?}");
+        }
+
+        // Both on-demand creation and warm replacement must remain usable.
+        for prewarmed in [0, 1] {
+            let config: AppConfig = toml::from_str(&format!(
+                "[workers]\nmax_workers=1\nprewarmed_workers={prewarmed}\nmemory_limit_mb=512"
+            ))
+            .unwrap();
+            let runtime = PyodideRuntime::new(&config).await.unwrap();
+            let output = run(&runtime, PYTHON_HEAP_PRESSURE).await;
+            assert!(!output.success, "{output:?}");
+            let error = output.error.as_ref().expect("memory-limit error");
+            assert_eq!(error.kind, "memory_limit", "{output:?}");
+            assert!(error.message.contains("512 MiB"), "{output:?}");
+            assert!(!output.timed_out, "{output:?}");
+
+            let output = run(&runtime, "assert 'retained' not in globals()\nprint(6 * 7)").await;
+            assert!(output.success, "{output:?}");
+            assert_eq!(output.stdout, "42\n");
+            assert!(runtime.health().is_ready());
+            runtime.shutdown();
+        }
+    }
 
     #[tokio::test]
     async fn runtime_applies_heap_limit_to_fresh_isolates() {

@@ -294,7 +294,26 @@ fits the platform's address size; invalid values prevent startup. This is a
 per-isolate V8 heap budget, not a total process memory limit. Size the container
 for `workers.max_workers` concurrent heaps plus Pyodide/WebAssembly memory, input
 buffers, caches, and other process overhead. Increasing the container memory
-limit alone does not increase this heap budget.
+limit alone does not increase this heap budget. In particular, WebAssembly
+linear memory used by ordinary Python objects is **not counted** toward
+`workers.memory_limit_mb`.
+
+When V8 approaches this budget, a near-heap-limit callback records memory
+exhaustion and terminates execution. It grants a fixed 64 MiB emergency reserve
+to let the current allocation finish and termination unwind; repeated callbacks
+do not grant further growth. The tool returns `error.kind = "memory_limit"`
+with the configured budget and `timed_out = false`. The isolate is discarded,
+and a prewarmed worker prepares a fresh replacement. Allow for this reserve per
+concurrent worker when sizing process memory.
+
+The heap-pressure regression allocates from Python using `pyodide.ffi.to_js`
+and retains the resulting JavaScript arrays. It does not depend on CSV decoding,
+which now occurs outside the V8 heap. After installing the npm assets and
+micropip wheel, run
+`cargo test python_heap_pressure_child_process -- --ignored --nocapture`.
+The test runs in a child process with a 180-second deadline and checks recovery
+with both cold and prewarmed workers. The shared CSV fixture and replay scripts
+remain available for testing large file inputs.
 
 Prewarmed workers initialize V8, Pyodide, and configured preinstalled packages
 before accepting work. Each execution still gets a fresh isolate. The worker
@@ -531,14 +550,14 @@ paths, package names, URLs, session IDs, or error messages.
 | `execution_queue_capacity` | Gauge | Configured maximum waiting jobs |
 | `execution_queue_wait_seconds` | Histogram | `outcome`: `dispatched`, `cancelled`, `shutdown`; enqueue until removal |
 | `workers` | Gauge | `state`: `idle`, `initializing`, `executing`; mutually exclusive live worker states |
-| `python_execution_duration_seconds` | Histogram | `outcome`: `success`, `python_error`, `timeout`, `runtime_failure`; excludes queue/init |
+| `python_execution_duration_seconds` | Histogram | `outcome`: `success`, `python_error`, `timeout`, `memory_limit`, `cancelled`, `runtime_failure`; excludes queue/init |
 | `isolate_initialization_duration_seconds` | Histogram | `phase`: `startup`, `on_demand`, `replenishment`; `outcome`: `success`, `runtime_failure` |
 | `execution_rejections_total` | Counter | `reason`: `validation`, `queue_full`, `shutdown` |
 | `worker_unexpected_exits_total` | Counter | Worker exits outside normal shutdown, including panics |
 
 Tool labels are `run_python_code`, `list_code_snippets`, `get_code_snippet`.
 Tool outcomes are `success`, `validation_error`, `overload`, `python_error`,
-`timeout`, `cancelled`, `runtime_failure`. Structured tool results determine
+`timeout`, `memory_limit`, `cancelled`, `runtime_failure`. Structured tool results determine
 outcomes, not HTTP status. These metrics cover handlers entered after MCP argument
 parsing; malformed protocol requests rejected before handler entry are not tool calls.
 A missing snippet is a successful lookup returning null. Rejections intentionally
