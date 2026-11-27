@@ -27,3 +27,6 @@ toml = "0.9.11"
 
 [build-dependencies]
 serde_json = "1.0.145"
+
+[dev-dependencies]
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }

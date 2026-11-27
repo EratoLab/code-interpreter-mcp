@@ -21,7 +21,8 @@ const BYTES_PER_MB: usize = 1024 * 1024;
 pub struct AppConfig {
     #[serde(default = "default_bind_address")]
     pub bind_addr: String,
-    pub allowed_hosts: Option<Vec<String>>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     #[serde(default)]
     pub http_allowed_hosts: Vec<String>,
     #[serde(default)]
@@ -31,6 +32,8 @@ pub struct AppConfig {
     pub preinstall_packages: Vec<String>,
     #[serde(default = "default_runtime_package_installation")]
     pub runtime_package_installation: bool,
+    #[serde(default = "default_runtime_package_installation_allowed_hosts")]
+    pub runtime_package_installation_allowed_hosts: Vec<String>,
     #[serde(default)]
     pub workers: WorkersConfig,
     pub package_cache_dir: Option<PathBuf>,
@@ -163,6 +166,12 @@ fn default_runtime_package_installation() -> bool {
     true
 }
 
+fn default_runtime_package_installation_allowed_hosts() -> Vec<String> {
+    ["cdn.jsdelivr.net", "pypi.org", "files.pythonhosted.org"]
+        .map(str::to_owned)
+        .into()
+}
+
 fn default_max_workers() -> usize {
     DEFAULT_MAX_WORKERS
 }
@@ -190,10 +199,7 @@ impl AppConfig {
         if let Ok(value) = env::var("CODE_INTERPRETER_MCP_BIND_ADDR") {
             config.bind_addr = value;
         }
-        if let Ok(value) = env::var("CODE_INTERPRETER_MCP_ALLOWED_HOSTS") {
-            config.allowed_hosts =
-                Some(value.split(',').map(str::trim).map(str::to_owned).collect());
-        }
+        config.apply_download_host_env(|key| env::var(key).ok());
         if let Some(value) = env::var_os("CODE_INTERPRETER_MCP_ASSET_DIR") {
             config.asset_dir = Some(PathBuf::from(value));
         }
@@ -248,6 +254,28 @@ impl AppConfig {
             .listen_address(&config.bind_addr)?;
         config.input_limits.validate()?;
         Ok(config)
+    }
+
+    fn apply_download_host_env(&mut self, get: impl Fn(&str) -> Option<String>) {
+        for (key, hosts) in [
+            (
+                "CODE_INTERPRETER_MCP_ALLOWED_HOSTS",
+                &mut self.allowed_hosts,
+            ),
+            (
+                "CODE_INTERPRETER_MCP_RUNTIME_PACKAGE_INSTALLATION_ALLOWED_HOSTS",
+                &mut self.runtime_package_installation_allowed_hosts,
+            ),
+        ] {
+            if let Some(value) = get(key) {
+                *hosts = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|host| !host.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+            }
+        }
     }
 
     pub fn package_cache_dir(&self) -> PathBuf {
@@ -590,7 +618,7 @@ mod tests {
             .unwrap(),
         );
         let config: AppConfig = base.try_into().unwrap();
-        assert_eq!(config.allowed_hosts.unwrap(), ["pypi.org"]);
+        assert_eq!(config.allowed_hosts, ["pypi.org"]);
         assert_eq!(config.http_allowed_hosts, ["mcp.example.com:8000"]);
         assert!(config.skip_host_header_verification);
         assert!(toml::from_str::<AppConfig>("http_allowed_hosts = 'example.com'").is_err());
@@ -602,17 +630,77 @@ mod tests {
         let defaults = AppConfig::from_files(&[]).unwrap();
         assert!(defaults.runtime_package_installation);
         assert!(defaults.preinstall_packages.is_empty());
+        assert!(defaults.allowed_hosts.is_empty());
+        assert_eq!(
+            defaults.runtime_package_installation_allowed_hosts,
+            ["cdn.jsdelivr.net", "pypi.org", "files.pythonhosted.org"]
+        );
         let mut base: toml::Value = toml::from_str(
-            "preinstall_packages = ['numpy', 'pandas']\nruntime_package_installation = true",
+            "preinstall_packages = ['numpy', 'pandas']
+             allowed_hosts = ['downloads.example']
+             runtime_package_installation_allowed_hosts = ['mirror.example']
+             runtime_package_installation = true",
         )
         .unwrap();
-        merge(&mut base, toml::from_str(
-            "preinstall_packages = ['snowballstemmer==3.0.1']\nruntime_package_installation = false"
-        ).unwrap());
+        let config: AppConfig = base.clone().try_into().unwrap();
+        assert_eq!(
+            config.runtime_package_installation_allowed_hosts,
+            ["mirror.example"]
+        );
+        merge(
+            &mut base,
+            toml::from_str(
+                "preinstall_packages = ['snowballstemmer==3.0.1']
+             runtime_package_installation_allowed_hosts = []
+             runtime_package_installation = false",
+            )
+            .unwrap(),
+        );
         let config: AppConfig = base.try_into().unwrap();
         assert!(!config.runtime_package_installation);
         assert_eq!(config.preinstall_packages, ["snowballstemmer==3.0.1"]);
+        assert_eq!(config.allowed_hosts, ["downloads.example"]);
+        assert!(config.runtime_package_installation_allowed_hosts.is_empty());
         assert!(toml::from_str::<AppConfig>("runtime_package_installation = 'false'").is_err());
+    }
+
+    #[test]
+    fn download_host_environment_overrides_are_independent() {
+        let mut config: AppConfig = toml::from_str(
+            "allowed_hosts = ['downloads.example']
+             runtime_package_installation_allowed_hosts = ['mirror.example']",
+        )
+        .unwrap();
+        config.apply_download_host_env(|key| match key {
+            "CODE_INTERPRETER_MCP_ALLOWED_HOSTS" => Some(" , files.example, data.example, ".into()),
+            _ => None,
+        });
+        assert_eq!(config.allowed_hosts, ["files.example", "data.example"]);
+        assert_eq!(
+            config.runtime_package_installation_allowed_hosts,
+            ["mirror.example"]
+        );
+
+        config.apply_download_host_env(|key| match key {
+            "CODE_INTERPRETER_MCP_ALLOWED_HOSTS" => Some(String::new()),
+            "CODE_INTERPRETER_MCP_RUNTIME_PACKAGE_INSTALLATION_ALLOWED_HOSTS" => {
+                Some("pypi.example, cdn.example".into())
+            }
+            _ => None,
+        });
+        assert!(config.allowed_hosts.is_empty());
+        assert_eq!(
+            config.runtime_package_installation_allowed_hosts,
+            ["pypi.example", "cdn.example"]
+        );
+
+        config.apply_download_host_env(|key| match key {
+            "CODE_INTERPRETER_MCP_RUNTIME_PACKAGE_INSTALLATION_ALLOWED_HOSTS" => {
+                Some(String::new())
+            }
+            _ => None,
+        });
+        assert!(config.runtime_package_installation_allowed_hosts.is_empty());
     }
 
     #[test]
@@ -665,7 +753,7 @@ mod tests {
         assert_eq!(paths.len(), 2);
         let config = AppConfig::from_files(&paths).unwrap();
         assert_eq!(config.bind_addr, "127.0.0.1:9000");
-        assert_eq!(config.allowed_hosts, Some(vec!["example.com".to_owned()]));
+        assert_eq!(config.allowed_hosts, ["example.com"]);
 
         fs::remove_dir_all(directory).unwrap();
     }

@@ -3,7 +3,6 @@
 {
   const core = globalThis.Deno.core;
   const {
-    op_fetch_content_type,
     op_fetch_url,
     op_read_package_layer_file,
     op_take_input_file,
@@ -120,15 +119,11 @@
     if (request.signal?.aborted) {
       throw request.signal.reason ?? new Error("The request was aborted");
     }
-    const bytes = await op_fetch_url(request.url);
+    const [bytes, contentType] = await op_fetch_url(request.url);
     if (request.signal?.aborted) {
       throw request.signal.reason ?? new Error("The request was aborted");
     }
-    return new SandboxResponse(
-      bytes,
-      request.url,
-      op_fetch_content_type(request.url),
-    );
+    return new SandboxResponse(bytes, request.url, contentType);
   }
 
   const crypto = Object.freeze({

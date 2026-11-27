@@ -152,11 +152,45 @@ unavailable import fails with a Python import error. `micropip.install` raises
 `RuntimeError: Runtime package installation is disabled`, even after reimporting
 or reloading micropip. Pyodide package-loading APIs are also disabled.
 
-In disabled mode, sandbox HTTPS downloads are blocked after initialization,
-including cached downloads, to prevent alternate download-based installers.
-Preinstallation still uses the configured HTTPS host allowlist. This is a package
-installation policy, not a restriction on executing Python source supplied in
-the request or its input files.
+The toggle controls the built-in installation mechanisms. Python can still
+execute source supplied in the request, included in its input files, or
+downloaded from an approved host.
+
+### HTTPS downloads
+
+`allowed_hosts` defaults to `[]` and permits general HTTPS GET requests from
+Python with either value of `runtime_package_installation`. For example:
+
+```toml
+allowed_hosts = ["trilux.com"]
+runtime_package_installation = false
+```
+
+```python
+from pathlib import Path
+from pyodide.http import pyfetch
+
+response = await pyfetch("https://www.trilux.com/path/to/file.pdf")
+Path("download.pdf").write_bytes(await response.bytes())
+```
+
+`runtime_package_installation_allowed_hosts` defaults to
+`["cdn.jsdelivr.net", "pypi.org", "files.pythonhosted.org"]`. An explicit list
+replaces these defaults, and `[]` permits no external package hosts for
+initialization. Startup and package-layer initialization use the package
+host list. During execution, Python can also reach the package hosts when
+runtime installation is enabled. A host in both lists remains available for
+general downloads when runtime installation is disabled.
+
+Both settings accept hostnames and their subdomains. The server checks the
+scheme and hostname of the initial URL and each redirect against the active
+policy. Use a direct HTTPS URL or include every host needed by its redirects.
+
+Roll out the updated configuration and image together. Move any package
+mirrors configured in `allowed_hosts` or `CODE_INTERPRETER_MCP_ALLOWED_HOSTS`
+to the corresponding package-host setting. Entries left in the general list
+permit downloads during user execution even when runtime installation is
+disabled.
 
 ### Configured code snippets
 
@@ -326,9 +360,9 @@ rebuilds the layer. New isolates copy package files from this local layer.
 The pinned Pyodide runtime files are served locally. Wheel files are not
 included in the npm package, so the Docker build downloads and verifies the
 micropip wheel against `pyodide-lock.json`. Other missing Pyodide package wheels
-are fetched from the matching versioned jsDelivr distribution and must be
-permitted by `allowed_hosts`. Runtime installs requested by user code still
-follow `runtime_package_installation` and the configured HTTPS host allowlist.
+are fetched from the matching versioned jsDelivr distribution. During
+initialization, that CDN must be permitted by
+`runtime_package_installation_allowed_hosts` when a wheel is missing locally.
 
 The cache directory defaults to `.code-interpreter-mcp-package-cache` in the
 working directory. Set `package_cache_dir` or
@@ -348,18 +382,19 @@ For example, `code-interpreter-mcp.toml` can contain:
 
 ```toml
 bind_addr = "127.0.0.1:8000"
-allowed_hosts = ["cdn.jsdelivr.net", "pypi.org", "files.pythonhosted.org"]
 asset_dir = "/app/node_modules/pyodide"
 ```
 
-All settings are optional. The existing environment variables override values
-from configuration files:
+All settings are optional. Environment variables override values from
+configuration files:
 
 - `CODE_INTERPRETER_MCP_BIND_ADDR`: HTTP socket address. Defaults to `127.0.0.1:8000`.
   Use `127.0.0.1:0` to let the operating system select a free port; the
   selected port is included in the startup announcement.
-- `CODE_INTERPRETER_MCP_ALLOWED_HOSTS`: comma-separated HTTPS package hosts. Defaults to
-  `cdn.jsdelivr.net,pypi.org,files.pythonhosted.org`. Subdomains are accepted.
+- `CODE_INTERPRETER_MCP_ALLOWED_HOSTS` overrides the general download hosts.
+- `CODE_INTERPRETER_MCP_RUNTIME_PACKAGE_INSTALLATION_ALLOWED_HOSTS` overrides
+  the package hosts. Both download overrides accept comma-separated hostnames,
+  ignore whitespace around entries, and treat an empty value as an empty list.
 - `CODE_INTERPRETER_MCP_ASSET_DIR`: overrides the local Pyodide asset directory. It must
   contain the files installed by the pinned `pyodide` npm package.
 - `CODE_INTERPRETER_MCP_PACKAGE_CACHE_DIR`: overrides the durable local package layer directory.
@@ -433,7 +468,7 @@ skip_host_header_verification = false
 A non-empty `http_allowed_hosts` list replaces the default loopback allowlist.
 A hostname permits any port; a `host:port` entry permits only that port. Omitted
 or empty lists retain the loopback defaults. These settings are independent of
-`bind_addr` and the outbound HTTPS package download `allowed_hosts` setting.
+`bind_addr` and the outbound HTTPS download settings.
 
 Set `skip_host_header_verification = true` to allow any inbound Host value,
 even when `http_allowed_hosts` is configured. This disables the Host allowlist
@@ -461,7 +496,8 @@ Per request limits:
 If a returned-file limit is exceeded, whole files outside the limit are
 omitted and `output_truncated` is set to `true`.
 
-Downloaded package artifacts are cached in memory for the life of the server.
+HTTPS downloads are cached in memory for the life of the server and reused
+under the same allowlist.
 Configured preinstalled packages are also captured in a durable local package
 layer at server startup and copied into fresh isolates. The package layer is
 recreated when the Pyodide version or configured package list changes.
@@ -485,8 +521,12 @@ limits.
 ```bash
 cargo fmt --check
 cargo test
-# Integration coverage requires npm assets and HTTPS package access:
+npm ci
+node scripts/fetch-pyodide-wheel.mjs node_modules/pyodide
+# Exercise package policy against a local HTTPS fixture.
 cargo test package_policy_in_fresh_sandboxes -- --ignored --nocapture
+# Verify default package installation against jsDelivr and PyPI.
+cargo test default_policy_installs_pyodide_and_pypi_packages -- --ignored --nocapture
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
