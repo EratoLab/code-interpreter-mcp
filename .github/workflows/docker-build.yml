@@ -391,7 +391,7 @@ jobs:
 
           ### Changes
 
-          See the commit history for details on what changed in this release.
+          See the commit history for changes in this release. [Configuration and rollout notes](https://github.com/${{ github.repository }}/blob/${{ github.sha }}/CHANGELOG.md)
 
           ### Registry Information
 

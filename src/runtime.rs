@@ -16,8 +16,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use deno_core::{
-    Extension, ExtensionFileSource, JsRuntime, OpState, RuntimeOptions, convert::Uint8Array, op2,
-    url::Url, v8,
+    Extension, ExtensionFileSource, JsRuntime, OpState, RuntimeOptions, ToJsBuffer,
+    convert::Uint8Array, op2, url::Url, v8,
 };
 use deno_error::JsErrorBox;
 
@@ -34,6 +34,7 @@ const PYODIDE_VERSION: &str = "314.0.2";
 const PYODIDE_PACKAGE_CDN: &str = "cdn.jsdelivr.net";
 const PACKAGE_CACHE_SCHEMA: u32 = 1;
 const MAX_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
+const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
 // A fixed reserve, granted at most once, lets V8 finish its current allocation
 // and observe termination. It is not an additional execution budget.
@@ -140,15 +141,92 @@ impl Drop for ExecutionWatchdog {
 #[derive(Clone)]
 struct RuntimeConfig {
     memory_limit_bytes: usize,
-    allowed_hosts: Arc<HashSet<String>>,
+    initialization_downloads: Arc<DownloadPolicy>,
+    user_downloads: Arc<DownloadPolicy>,
     asset_dir: Arc<PathBuf>,
-    client: reqwest::Client,
-    download_cache: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
-    content_types: Arc<Mutex<HashMap<String, String>>>,
     preinstall_packages: Vec<String>,
     runtime_package_installation: bool,
     package_cache_dir: Arc<PathBuf>,
     package_layer: Option<Arc<PackageLayer>>,
+}
+
+struct DownloadPolicy {
+    allowed_hosts: Arc<HashSet<String>>,
+    client: reqwest::Client,
+    // A response and its metadata are reusable only under the same host policy.
+    cache: Mutex<HashMap<Url, Arc<Download>>>,
+}
+
+#[derive(Debug)]
+struct Download {
+    bytes: Vec<u8>,
+    content_type: String,
+}
+
+impl DownloadPolicy {
+    fn new(allowed_hosts: HashSet<String>, client: reqwest::ClientBuilder) -> Result<Self> {
+        let allowed_hosts = Arc::new(allowed_hosts);
+        let redirect_hosts = allowed_hosts.clone();
+        let default_redirects = reqwest::redirect::Policy::default();
+        let client = client
+            .user_agent(concat!("code-interpreter-mcp/", env!("CARGO_PKG_VERSION")))
+            .timeout(Duration::from_secs(45))
+            .redirect(reqwest::redirect::Policy::custom(
+                move |attempt| match validate_network_url(attempt.url(), &redirect_hosts) {
+                    Ok(_) => default_redirects.redirect(attempt),
+                    Err(error) => attempt.error(error.into_boxed_dyn_error()),
+                },
+            ))
+            .build()
+            .context("could not build sandbox HTTP client")?;
+        Ok(Self {
+            allowed_hosts,
+            client,
+            cache: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+impl RuntimeConfig {
+    fn new(
+        config: &AppConfig,
+        client_builder: impl Fn() -> reqwest::ClientBuilder,
+    ) -> Result<Self> {
+        let package_hosts = normalize_hosts(&config.runtime_package_installation_allowed_hosts);
+        let mut user_hosts = normalize_hosts(&config.allowed_hosts);
+        if config.runtime_package_installation {
+            user_hosts.extend(package_hosts.iter().cloned());
+        }
+
+        let initialization_downloads =
+            Arc::new(DownloadPolicy::new(package_hosts, client_builder())?);
+        let user_downloads = if user_hosts == *initialization_downloads.allowed_hosts {
+            initialization_downloads.clone()
+        } else {
+            Arc::new(DownloadPolicy::new(user_hosts, client_builder())?)
+        };
+
+        Ok(Self {
+            memory_limit_bytes: config.workers.memory_limit_bytes()?,
+            initialization_downloads,
+            user_downloads,
+            asset_dir: Arc::new(config.asset_dir.clone().unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("node_modules/pyodide")
+            })),
+            preinstall_packages: config.preinstall_packages.clone(),
+            runtime_package_installation: config.runtime_package_installation,
+            package_cache_dir: Arc::new(config.package_cache_dir()),
+            package_layer: None,
+        })
+    }
+}
+
+fn normalize_hosts(hosts: &[String]) -> HashSet<String> {
+    hosts
+        .iter()
+        .map(|host| host.trim().to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,28 +431,25 @@ impl Drop for WorkerPoolOwner {
 struct UserExecutionStarted(bool);
 
 #[op2]
+#[serde]
 async fn op_fetch_url(
     state: Rc<RefCell<OpState>>,
     #[string] raw_url: String,
-) -> Result<Uint8Array, JsErrorBox> {
-    let config = {
+) -> Result<(ToJsBuffer, String), JsErrorBox> {
+    let (config, user_execution_started) = {
         let state = state.borrow();
-        if state.borrow::<UserExecutionStarted>().0
-            && !state.borrow::<RuntimeConfig>().runtime_package_installation
-        {
-            return Err(JsErrorBox::generic(
-                "Runtime package installation is disabled; sandbox downloads are disabled after preinstallation",
-            ));
-        }
-        state.borrow::<RuntimeConfig>().clone()
+        (
+            state.borrow::<RuntimeConfig>().clone(),
+            state.borrow::<UserExecutionStarted>().0,
+        )
     };
-    if !state.borrow().borrow::<UserExecutionStarted>().0 {
+    if !user_execution_started {
         eprintln!("Python packages: initialization fetching {raw_url} (may use cached artifact)");
     }
-    let bytes = fetch_url(&config, &raw_url)
+    let download = fetch_url(&config, user_execution_started, &raw_url)
         .await
         .map_err(|error| JsErrorBox::generic(format!("Sandbox fetch failed: {error:#}")))?;
-    Ok(bytes.as_ref().clone().into())
+    Ok((download.bytes.clone().into(), download.content_type.clone()))
 }
 
 // Request-local buffers are consumed once and moved into V8 backing stores.
@@ -413,19 +488,6 @@ async fn op_read_package_layer_file(
     Ok(bytes.into())
 }
 
-#[op2]
-#[string]
-fn op_fetch_content_type(state: &OpState, #[string] raw_url: String) -> String {
-    state
-        .borrow::<RuntimeConfig>()
-        .content_types
-        .lock()
-        .expect("content-type cache mutex was poisoned")
-        .get(&raw_url)
-        .cloned()
-        .unwrap_or_else(|| "application/octet-stream".to_owned())
-}
-
 #[op2(fast)]
 fn op_package_log(#[string] message: String) {
     eprintln!("Python packages: {message}");
@@ -444,7 +506,6 @@ deno_core::extension!(
         op_fetch_url,
         op_take_input_file,
         op_read_package_layer_file,
-        op_fetch_content_type,
         op_random_fill,
         op_package_log
     ],
@@ -478,45 +539,14 @@ impl PyodideRuntime {
 
     pub(crate) async fn new(config: &AppConfig) -> Result<Self> {
         config.validate_worker_settings()?;
-        let mut allowed_hosts = config
-            .allowed_hosts
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(String::as_str)
-            .map(|host| host.trim().to_ascii_lowercase())
-            .filter(|host| !host.is_empty())
-            .collect::<HashSet<_>>();
-        if allowed_hosts.is_empty() {
-            allowed_hosts.extend([
-                "cdn.jsdelivr.net".to_owned(),
-                "files.pythonhosted.org".to_owned(),
-                "pypi.org".to_owned(),
-            ]);
-        }
+        Self::start(
+            config,
+            RuntimeConfig::new(config, reqwest::Client::builder)?,
+        )
+        .await
+    }
 
-        let asset_dir = config.asset_dir.clone().unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("node_modules/pyodide")
-        });
-
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("code-interpreter-mcp/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(45))
-            .build()
-            .expect("the static HTTP client configuration is valid");
-
-        let mut runtime_config = RuntimeConfig {
-            memory_limit_bytes: config.workers.memory_limit_bytes()?,
-            preinstall_packages: config.preinstall_packages.clone(),
-            runtime_package_installation: config.runtime_package_installation,
-            package_cache_dir: Arc::new(config.package_cache_dir()),
-            allowed_hosts: Arc::new(allowed_hosts),
-            asset_dir: Arc::new(asset_dir),
-            client,
-            download_cache: Arc::new(Mutex::new(HashMap::new())),
-            content_types: Arc::new(Mutex::new(HashMap::new())),
-            package_layer: None,
-        };
+    async fn start(config: &AppConfig, mut runtime_config: RuntimeConfig) -> Result<Self> {
         ensure_assets(&runtime_config.asset_dir)?;
         if !runtime_config.preinstall_packages.is_empty() {
             runtime_config.package_layer = Some(Arc::new(
@@ -1082,114 +1112,138 @@ fn ensure_assets(asset_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_url(config: &RuntimeConfig, raw_url: &str) -> Result<Arc<Vec<u8>>> {
+async fn fetch_url(
+    config: &RuntimeConfig,
+    user_execution_started: bool,
+    raw_url: &str,
+) -> Result<Arc<Download>> {
     let url = Url::parse(raw_url).with_context(|| format!("invalid URL: {raw_url}"))?;
-    let host = url
-        .host_str()
-        .context("network URL does not contain a host")?
-        .to_ascii_lowercase();
+    let policy = if user_execution_started {
+        &config.user_downloads
+    } else {
+        &config.initialization_downloads
+    };
 
+    // The Pyodide loader uses a virtual origin for bundled assets and wheels.
+    if url.scheme() == "https"
+        && url.host_str() == Some(PYODIDE_ORIGIN)
+        && (!user_execution_started || config.runtime_package_installation)
+    {
+        return fetch_pyodide_asset(&config.asset_dir, policy, &url).await;
+    }
+
+    fetch_network_url(policy, url).await
+}
+
+async fn fetch_pyodide_asset(
+    asset_dir: &Path,
+    policy: &DownloadPolicy,
+    url: &Url,
+) -> Result<Arc<Download>> {
+    let mut relative = PathBuf::new();
+    for segment in url
+        .path_segments()
+        .context("invalid local Pyodide asset path")?
+        .filter(|segment| !segment.is_empty())
+    {
+        relative.push(segment);
+    }
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative.components().count() != 1
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("local Pyodide asset path is invalid");
+    }
+    let asset_path = asset_dir.join(&relative);
+    let root = tokio::fs::canonicalize(asset_dir)
+        .await
+        .context("could not resolve local Pyodide asset directory")?;
+    let resolved_asset = match tokio::fs::canonicalize(&asset_path).await {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Missing wheel files are fetched from the matching Pyodide CDN distribution.
+            let cdn_url = Url::parse(&format!(
+                "https://{PYODIDE_PACKAGE_CDN}/pyodide/v{PYODIDE_VERSION}/full/{}",
+                relative.display()
+            ))?;
+            return fetch_network_url(policy, cdn_url).await.with_context(|| {
+                format!(
+                    "local Pyodide asset {} is missing and its CDN fallback failed",
+                    relative.display()
+                )
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not resolve local Pyodide asset {}",
+                    relative.display()
+                )
+            });
+        }
+    };
+    if !resolved_asset.starts_with(&root) || !resolved_asset.is_file() {
+        bail!(
+            "local Pyodide asset is not available: {}",
+            relative.display()
+        );
+    }
+    let bytes = tokio::fs::read(resolved_asset)
+        .await
+        .with_context(|| format!("could not read local Pyodide asset {}", relative.display()))?;
+    let content_type = match relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some("json") => "application/json",
+        Some("js") => "text/javascript",
+        Some("wasm") => "application/wasm",
+        _ => DEFAULT_CONTENT_TYPE,
+    };
+    Ok(Arc::new(Download {
+        bytes,
+        content_type: content_type.to_owned(),
+    }))
+}
+
+fn validate_network_url<'a>(url: &'a Url, allowed_hosts: &HashSet<String>) -> Result<&'a str> {
     if url.scheme() != "https" {
         bail!("only HTTPS URLs are allowed");
     }
-
-    if host == PYODIDE_ORIGIN {
-        let mut relative = PathBuf::new();
-        for segment in url
-            .path_segments()
-            .context("invalid local Pyodide asset path")?
-            .filter(|segment| !segment.is_empty())
-        {
-            relative.push(segment);
-        }
-        if relative.as_os_str().is_empty()
-            || relative.is_absolute()
-            || relative.components().count() != 1
-            || relative
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            bail!("local Pyodide asset path is invalid");
-        }
-        let asset_path = config.asset_dir.join(&relative);
-        let root = tokio::fs::canonicalize(config.asset_dir.as_ref())
-            .await
-            .context("could not resolve local Pyodide asset directory")?;
-        let resolved_asset = match tokio::fs::canonicalize(&asset_path).await {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                // The npm Pyodide package contains the runtime, but not the
-                // wheel files referenced by pyodide-lock.json. Fetch those
-                // from the matching, versioned Pyodide CDN distribution.
-                let cdn_url = format!(
-                    "https://{PYODIDE_PACKAGE_CDN}/pyodide/v{PYODIDE_VERSION}/full/{}",
-                    relative.display()
-                );
-                return Box::pin(fetch_url(config, &cdn_url))
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "local Pyodide asset {} is missing and its CDN fallback failed",
-                            relative.display()
-                        )
-                    });
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "could not resolve local Pyodide asset {}",
-                        relative.display()
-                    )
-                });
-            }
-        };
-        if !resolved_asset.starts_with(&root) || !resolved_asset.is_file() {
-            bail!(
-                "local Pyodide asset is not available: {}",
-                relative.display()
-            );
-        }
-        let bytes = tokio::fs::read(resolved_asset).await.with_context(|| {
-            format!("could not read local Pyodide asset {}", relative.display())
-        })?;
-        let content_type = match relative
-            .extension()
-            .and_then(|extension| extension.to_str())
-        {
-            Some("json") => "application/json",
-            Some("js") => "text/javascript",
-            Some("wasm") => "application/wasm",
-            _ => "application/octet-stream",
-        };
-        config
-            .content_types
-            .lock()
-            .expect("content-type cache mutex was poisoned")
-            .insert(raw_url.to_owned(), content_type.to_owned());
-        return Ok(Arc::new(bytes));
-    }
-
-    if !config
-        .allowed_hosts
-        .iter()
-        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+    let host = url
+        .host_str()
+        .context("network URL does not contain a host")?;
+    if host == PYODIDE_ORIGIN
+        || !allowed_hosts.iter().any(|allowed| {
+            host == allowed
+                || host
+                    .strip_suffix(allowed)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        })
     {
         bail!("network host is not allowlisted: {host}");
     }
+    Ok(host)
+}
 
-    if let Some(cached) = config
-        .download_cache
+async fn fetch_network_url(policy: &DownloadPolicy, url: Url) -> Result<Arc<Download>> {
+    let host = validate_network_url(&url, &policy.allowed_hosts)?;
+    if let Some(cached) = policy
+        .cache
         .lock()
         .expect("download cache mutex was poisoned")
-        .get(raw_url)
+        .get(&url)
         .cloned()
     {
         return Ok(cached);
     }
 
-    let mut response = config
+    let mut response = policy
         .client
-        .get(url)
+        .get(url.clone())
         .header(
             reqwest::header::ACCEPT,
             "application/vnd.pypi.simple.v1+json, */*;q=0.01",
@@ -1206,7 +1260,7 @@ async fn fetch_url(config: &RuntimeConfig, raw_url: &str) -> Result<Arc<Vec<u8>>
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/octet-stream")
+        .unwrap_or(DEFAULT_CONTENT_TYPE)
         .to_owned();
     let mut bytes = Vec::with_capacity(
         response
@@ -1225,37 +1279,29 @@ async fn fetch_url(config: &RuntimeConfig, raw_url: &str) -> Result<Arc<Vec<u8>>
         bytes.extend_from_slice(&chunk);
     }
 
-    let bytes = Arc::new(bytes);
-    config
-        .download_cache
+    let download = Arc::new(Download {
+        bytes,
+        content_type,
+    });
+    policy
+        .cache
         .lock()
         .expect("download cache mutex was poisoned")
-        .insert(raw_url.to_owned(), bytes.clone());
-    config
-        .content_types
-        .lock()
-        .expect("content-type cache mutex was poisoned")
-        .insert(raw_url.to_owned(), content_type);
-    Ok(bytes)
+        .insert(url, download.clone());
+    Ok(download)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    mod https_fixture;
+    mod package_policy;
+
     fn pressure_config(memory_limit_mb: usize) -> RuntimeConfig {
-        RuntimeConfig {
-            memory_limit_bytes: memory_limit_mb * 1024 * 1024,
-            allowed_hosts: Arc::new(HashSet::new()),
-            asset_dir: Arc::new(PathBuf::new()),
-            client: reqwest::Client::new(),
-            download_cache: Arc::new(Mutex::new(HashMap::new())),
-            content_types: Arc::new(Mutex::new(HashMap::new())),
-            preinstall_packages: Vec::new(),
-            runtime_package_installation: false,
-            package_cache_dir: Arc::new(PathBuf::new()),
-            package_layer: None,
-        }
+        let mut config: AppConfig = toml::from_str("runtime_package_installation = false").unwrap();
+        config.workers.memory_limit_mb = memory_limit_mb;
+        RuntimeConfig::new(&config, reqwest::Client::builder).unwrap()
     }
 
     // V8 aborts cannot be caught by Rust: all pressure cases run in a child.
@@ -1455,18 +1501,7 @@ while True:
     async fn runtime_applies_heap_limit_to_fresh_isolates() {
         for source in ["", "[workers]\nmemory_limit_mb = 1024"] {
             let config: AppConfig = toml::from_str(source).unwrap();
-            let runtime_config = RuntimeConfig {
-                memory_limit_bytes: config.workers.memory_limit_bytes().unwrap(),
-                allowed_hosts: Arc::new(HashSet::new()),
-                asset_dir: Arc::new(PathBuf::new()),
-                client: reqwest::Client::new(),
-                download_cache: Arc::new(Mutex::new(HashMap::new())),
-                content_types: Arc::new(Mutex::new(HashMap::new())),
-                preinstall_packages: Vec::new(),
-                runtime_package_installation: true,
-                package_cache_dir: Arc::new(PathBuf::new()),
-                package_layer: None,
-            };
+            let runtime_config = RuntimeConfig::new(&config, reqwest::Client::builder).unwrap();
             // Startup, cold workers and warm replacements share this factory.
             for _ in 0..2 {
                 let mut runtime = create_runtime(&runtime_config.clone()).unwrap();
@@ -1723,70 +1758,5 @@ print('mounted')"#
         )
         .await;
         assert!(output.success, "{output:?}");
-    }
-
-    // These exercise real Pyodide and need npm assets and package-download access.
-    #[tokio::test]
-    #[ignore = "requires npm ci and HTTPS package downloads"]
-    async fn package_policy_in_fresh_sandboxes() {
-        let config: AppConfig =
-            toml::from_str("preinstall_packages = ['pandas', 'snowballstemmer==3.0.1']\nruntime_package_installation = false")
-                .unwrap();
-        let runtime = PyodideRuntime::new(&config).await.unwrap();
-        for _ in 0..2 {
-            let output = run(
-                &runtime,
-                "import pandas, numpy, snowballstemmer, json\nprint(numpy.arange(3).sum())",
-            )
-            .await;
-            assert!(output.success, "{output:?}");
-            assert_eq!(output.stdout, "3\n");
-        }
-        for code in [
-            "import scipy",
-            "import micropip\nawait micropip.install('snowballstemmer')",
-            "import importlib, micropip\nimportlib.reload(micropip)\nawait micropip.install('snowballstemmer')",
-            "import sys, micropip\ndel sys.modules['micropip']\nimport micropip\nawait micropip.install('snowballstemmer')",
-            "import pyodide_js\nawait pyodide_js.loadPackage('scipy')",
-            "from pyodide.http import pyfetch\nawait pyfetch('https://pypi.org/simple/snowballstemmer/')",
-        ] {
-            let output = run(&runtime, code).await;
-            assert!(!output.success, "{code}: {output:?}");
-            assert!(!output.timed_out, "{output:?}");
-            let message = &output.error.as_ref().unwrap().message;
-            assert!(
-                message.contains("disabled")
-                    || output
-                        .error
-                        .as_ref()
-                        .unwrap()
-                        .traceback
-                        .as_deref()
-                        .unwrap_or("")
-                        .contains("No module named 'scipy'"),
-                "{output:?}"
-            );
-        }
-        for source in ["", "runtime_package_installation = true"] {
-            let config: AppConfig = toml::from_str(source).unwrap();
-            let runtime = PyodideRuntime::new(&config).await.unwrap();
-            let output = run(&runtime, "import numpy\nimport micropip\nawait micropip.install('snowballstemmer')\nimport snowballstemmer\nprint(numpy.arange(3).sum())").await;
-            assert!(output.success, "{output:?}");
-            assert_eq!(output.stdout, "3\n");
-        }
-        let config: AppConfig =
-            toml::from_str("preinstall_packages = ['this-package-does-not-exist-ermcp20']")
-                .unwrap();
-        let runtime = PyodideRuntime::new(&config).await.unwrap();
-        let output = run(&runtime, "print('must not run')").await;
-        assert!(!output.success, "{output:?}");
-        assert!(output.stdout.is_empty());
-        assert!(
-            output
-                .error
-                .unwrap()
-                .message
-                .contains("this-package-does-not-exist-ermcp20")
-        );
     }
 }
